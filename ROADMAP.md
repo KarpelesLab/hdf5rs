@@ -56,14 +56,14 @@ Goal: open a file and walk its group hierarchy, list objects and attributes.
       (`OCHK`), header message iteration
 - [x] Old-style groups: symbol table message, v1 B-tree (group nodes),
       symbol table nodes (`SNOD`), local heap (`HEAP`)
-- [ ] New-style groups: link info, link messages (hard, soft, external),
+- [x] New-style groups: link info, link messages (hard, soft, external),
       group info message
 - [x] Dense link storage: fractal heap (`FRHP`, `FHDB`, `FHIB`, huge/tiny
       objects) and v2 B-tree (`BTHD`, `BTIN`, `BTLF`) name/creation-order
       indexes
-- [ ] Path resolution (`/a/b/c`), soft-link following with cycle limits;
+- [x] Path resolution (`/a/b/c`), soft-link following with cycle limits;
       external links reported but not followed by default
-- [ ] Public API sketch: `File::open`, `Group`, `Dataset`, `Attribute`,
+- [x] Public API sketch: `File::open`, `Group`, `Dataset`, `Attribute`,
       iteration over members
 
 ## Milestone 2 — Read: datatypes, dataspaces and data (`0.2`)
@@ -72,43 +72,43 @@ Goal: read the raw contents of uncompressed datasets and attributes.
 
 - [x] Dataspace message: scalar, simple (with max dims), null
 - [x] Datatype message, all classes (§ IV.A.2.d):
-  - [ ] fixed-point (integers, any size/endianness/sign)
-  - [ ] floating-point (IEEE f16/f32/f64, non-native layouts best effort)
-  - [ ] strings (fixed-length; null-terminated / null-padded / space-padded;
+  - [x] fixed-point (integers, any size/endianness/sign)
+  - [x] floating-point (IEEE f16/f32/f64, non-native layouts best effort)
+  - [x] strings (fixed-length; null-terminated / null-padded / space-padded;
         ASCII / UTF-8)
-  - [ ] bitfield, opaque, enum
-  - [ ] compound (member offsets, nested types)
-  - [ ] array
-  - [ ] variable-length sequences and strings (global heap `GCOL`)
-  - [ ] references (object, region; revised reference format)
-  - [ ] time (rare; parse, expose raw)
-- [x] Data layout message versions 1–4: compact, contiguous
+  - [x] bitfield, opaque, enum
+  - [x] compound (member offsets, nested types)
+  - [x] array
+  - [x] variable-length sequences and strings (global heap `GCOL`)
+  - [x] references (object, region; revised reference format)
+  - [x] time (rare; parse, expose raw)
+- [x] Data layout message versions 1–5 (v5 is written by HDF5 2.0): compact, contiguous
 - [x] Fill value messages (old and new)
-- [ ] Attribute message (versions 1–3), attribute info message, dense
+- [x] Attribute message (versions 1–3), attribute info message, dense
       attribute storage (fractal heap + v2 B-tree)
-- [ ] Shared object header messages (committed datatypes, SOHM table
+- [x] Shared object header messages (committed datatypes, SOHM table
       `SMTB` / `SMLI`) — read side
 - [ ] Typed read API: `dataset.read::<T>()` into `Vec<T>` for primitive
       types, plus a raw-bytes + datatype-descriptor path for everything else;
       a small `H5Type` trait users can implement (derive macro later, as a
       separate optional crate)
-- [ ] Hyperslab selection on read (start/stride/count/block)
+- [x] Hyperslab selection on read (start/stride/count/block)
 
 ## Milestone 3 — Read: chunked storage and filters (`0.3`)
 
 Goal: read the vast majority of real-world files, including compressed ones.
 
-- [ ] Chunked layout with every chunk index type:
-  - [ ] v1 B-tree (raw data chunk nodes) — layout v1–3
-  - [ ] single chunk, implicit, fixed array (`FAHD`/`FADB`), extensible array
+- [x] Chunked layout with every chunk index type:
+  - [x] v1 B-tree (raw data chunk nodes) — layout v1–3
+  - [x] single chunk, implicit, fixed array (`FAHD`/`FADB`), extensible array
         (`EAHD`/`EAIB`/`EASB`/`EADB`), v2 B-tree — layout v4
 - [x] Filter pipeline message (versions 1 and 2), per-chunk filter masks
 - [ ] Filters implemented in-crate:
   - [x] deflate (zlib) — via `compcol`
   - [x] shuffle
-  - [x] Fletcher-32 (to be verified against fixtures)
+  - [x] Fletcher-32 (verified against fixtures)
   - [ ] N-bit and scale-offset
-  - [x] LZF (common in h5py output; to be verified against fixtures)
+  - [x] LZF (common in h5py output; verified against fixtures)
 - [x] Pluggable filters: a `Filter` trait plus registry so users can add
       codecs without the core depending on them
 - [ ] Optional `compcol`-backed features for Zstd, LZ4, bzip2 (and Blosc
