@@ -3,8 +3,15 @@
 //! Everything in this module mirrors the HDF5 File Format Specification
 //! closely; the friendly public API is built on top of it.
 
+pub mod btree_v1;
+pub mod global_heap;
+pub mod group_v1;
+pub mod local_heap;
 mod reader;
 mod symbol_table_entry;
+pub mod symbol_table_node;
+#[cfg(test)]
+mod test_util;
 
 pub use reader::ByteReader;
 pub use symbol_table_entry::{ScratchPad, SymbolTableEntry};
