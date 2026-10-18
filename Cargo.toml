@@ -1,0 +1,19 @@
+[package]
+name = "hdf5rs"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.95"
+description = "Pure Rust, minimal-dependency reader and writer for HDF5 files"
+license = "MIT"
+repository = "https://github.com/KarpelesLab/hdf5rs"
+readme = "README.md"
+keywords = ["hdf5", "scientific", "file-format", "pure-rust"]
+categories = ["encoding", "parser-implementations", "science"]
+exclude = ["/.github"]
+
+[dependencies]
+
+[dev-dependencies]
+
+[features]
+default = []
