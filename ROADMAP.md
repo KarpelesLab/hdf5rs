@@ -31,6 +31,9 @@ clean-room policy in the README).
 
 ## Milestone 0 — Foundations (`0.0.x`)
 
+Low-level parsers marked [x] below exist with unit tests; they are being
+validated end-to-end against the fixture corpus as the high-level API lands.
+
 - [x] Crate scaffold, CI (stable + MSRV, fmt, clippy, docs), license
 - [x] Error type (`Error`, `Result`), no panics on malformed input
 - [x] Storage abstraction: positional read trait, `File` and in-memory
@@ -38,7 +41,7 @@ clean-room policy in the README).
 - [x] Little-endian byte cursor with variable-width *offset* and *length*
       fields (sizes from the superblock), "undefined address" handling
 - [x] Jenkins `lookup3` checksum (§ checksum used by v2 structures)
-- [ ] Test fixture corpus: script (outside the crate build) that generates a
+- [x] Test fixture corpus: script (outside the crate build) that generates a
       set of `.h5` files with h5py, plus checked-in small fixtures
 - [ ] Basic fuzz harness (`cargo fuzz`, kept out of the published crate)
 
@@ -46,16 +49,16 @@ clean-room policy in the README).
 
 Goal: open a file and walk its group hierarchy, list objects and attributes.
 
-- [ ] Superblock discovery (offset 0, 512, 1024, … for user blocks)
-- [ ] Superblock versions 0, 1, 2, 3 (§ Level 0A); driver info block (read &
+- [x] Superblock discovery (offset 0, 512, 1024, … for user blocks)
+- [x] Superblock versions 0, 1, 2, 3 (§ Level 0A); driver info block (read &
       ignore for non-default drivers)
-- [ ] Object headers version 1 and version 2 (`OHDR`), continuation blocks
+- [x] Object headers version 1 and version 2 (`OHDR`), continuation blocks
       (`OCHK`), header message iteration
-- [ ] Old-style groups: symbol table message, v1 B-tree (group nodes),
+- [x] Old-style groups: symbol table message, v1 B-tree (group nodes),
       symbol table nodes (`SNOD`), local heap (`HEAP`)
 - [ ] New-style groups: link info, link messages (hard, soft, external),
       group info message
-- [ ] Dense link storage: fractal heap (`FRHP`, `FHDB`, `FHIB`, huge/tiny
+- [x] Dense link storage: fractal heap (`FRHP`, `FHDB`, `FHIB`, huge/tiny
       objects) and v2 B-tree (`BTHD`, `BTIN`, `BTLF`) name/creation-order
       indexes
 - [ ] Path resolution (`/a/b/c`), soft-link following with cycle limits;
@@ -67,8 +70,8 @@ Goal: open a file and walk its group hierarchy, list objects and attributes.
 
 Goal: read the raw contents of uncompressed datasets and attributes.
 
-- [ ] Dataspace message: scalar, simple (with max dims), null
-- [ ] Datatype message, all classes (§ IV.A.2.d):
+- [x] Dataspace message: scalar, simple (with max dims), null
+- [x] Datatype message, all classes (§ IV.A.2.d):
   - [ ] fixed-point (integers, any size/endianness/sign)
   - [ ] floating-point (IEEE f16/f32/f64, non-native layouts best effort)
   - [ ] strings (fixed-length; null-terminated / null-padded / space-padded;
@@ -79,8 +82,8 @@ Goal: read the raw contents of uncompressed datasets and attributes.
   - [ ] variable-length sequences and strings (global heap `GCOL`)
   - [ ] references (object, region; revised reference format)
   - [ ] time (rare; parse, expose raw)
-- [ ] Data layout message versions 1–4: compact, contiguous
-- [ ] Fill value messages (old and new)
+- [x] Data layout message versions 1–4: compact, contiguous
+- [x] Fill value messages (old and new)
 - [ ] Attribute message (versions 1–3), attribute info message, dense
       attribute storage (fractal heap + v2 B-tree)
 - [ ] Shared object header messages (committed datatypes, SOHM table
@@ -99,7 +102,7 @@ Goal: read the vast majority of real-world files, including compressed ones.
   - [ ] v1 B-tree (raw data chunk nodes) — layout v1–3
   - [ ] single chunk, implicit, fixed array (`FAHD`/`FADB`), extensible array
         (`EAHD`/`EAIB`/`EASB`/`EADB`), v2 B-tree — layout v4
-- [ ] Filter pipeline message (versions 1 and 2), per-chunk filter masks
+- [x] Filter pipeline message (versions 1 and 2), per-chunk filter masks
 - [ ] Filters implemented in-crate:
   - [x] deflate (zlib) — via `compcol`
   - [x] shuffle
