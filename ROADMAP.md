@@ -143,10 +143,10 @@ Goal: create new files that the reference tools read without complaint.
       single-chunk indexes (and v1 B-tree in compat mode)
 - [x] Resizable datasets (unlimited dimensions), append workflows
 - [x] Filters on write: deflate, shuffle, Fletcher-32, LZF
-- [ ] Open existing files read-write: add/delete objects and attributes,
+- [x] Open existing files read-write: add/delete objects and attributes,
       overwrite data in place, extend datasets
 - [x] Partial (hyperslab) writes
-- [ ] Crash-consistency considerations; optional SWMR-compatible write order
+- [~] Crash-consistency considerations (new-structures-first write order done); optional SWMR-compatible write order
       (documented, best effort)
 
 ## Milestone 6 — Hardening and ergonomics (`0.6` → `1.0`)
