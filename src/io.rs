@@ -120,6 +120,50 @@ impl ReadAt for std::fs::File {
     }
 }
 
+/// A view of another store shifted by a fixed base offset.
+///
+/// HDF5 addresses are relative to the superblock's base address; wrapping
+/// the underlying file in an `OffsetReader` lets parsers use file addresses
+/// directly. Position `p` of the view maps to `base + p` of the inner store.
+#[derive(Debug, Clone)]
+pub struct OffsetReader<R> {
+    inner: R,
+    base: u64,
+}
+
+impl<R: ReadAt> OffsetReader<R> {
+    /// Create a view of `inner` starting at absolute offset `base`.
+    pub fn new(inner: R, base: u64) -> Self {
+        OffsetReader { inner, base }
+    }
+
+    /// The absolute offset of position 0 of this view.
+    pub fn base(&self) -> u64 {
+        self.base
+    }
+
+    /// The wrapped store.
+    pub fn inner(&self) -> &R {
+        &self.inner
+    }
+
+    /// Unwrap, returning the inner store.
+    pub fn into_inner(self) -> R {
+        self.inner
+    }
+}
+
+impl<R: ReadAt> ReadAt for OffsetReader<R> {
+    fn read_exact_at(&self, pos: u64, buf: &mut [u8]) -> Result<()> {
+        let abs = self.base.checked_add(pos).ok_or(Error::UnexpectedEof)?;
+        self.inner.read_exact_at(abs, buf)
+    }
+
+    fn size(&self) -> Result<u64> {
+        Ok(self.inner.size()?.saturating_sub(self.base))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -139,5 +183,17 @@ mod tests {
             Err(Error::UnexpectedEof)
         ));
         assert!(data[..].read_vec_at(1, 100).is_err());
+    }
+
+    #[test]
+    fn offset_reader() {
+        let data = [1u8, 2, 3, 4, 5];
+        let r = OffsetReader::new(&data[..], 2);
+        assert_eq!(r.size().unwrap(), 3);
+        assert_eq!(r.read_vec_at(0, 3).unwrap(), vec![3, 4, 5]);
+        assert!(r.read_vec_at(1, 3).is_err());
+        assert!(r.read_vec_at(u64::MAX, 1).is_err());
+        let r = OffsetReader::new(&data[..], 10);
+        assert_eq!(r.size().unwrap(), 0);
     }
 }

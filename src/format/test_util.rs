@@ -122,6 +122,84 @@ impl FileBuilder {
     }
 }
 
+/// A little-endian byte writer.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct W {
+    pub buf: Vec<u8>,
+    pub sizes: Sizes,
+}
+
+impl W {
+    pub fn new() -> Self {
+        W::default()
+    }
+
+    pub fn with_sizes(sizes: Sizes) -> Self {
+        W {
+            buf: Vec::new(),
+            sizes,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.buf.len()
+    }
+
+    pub fn u8(&mut self, v: u8) -> &mut Self {
+        self.buf.push(v);
+        self
+    }
+
+    pub fn u16(&mut self, v: u16) -> &mut Self {
+        self.buf.extend_from_slice(&v.to_le_bytes());
+        self
+    }
+
+    pub fn u32(&mut self, v: u32) -> &mut Self {
+        self.buf.extend_from_slice(&v.to_le_bytes());
+        self
+    }
+
+    pub fn u64(&mut self, v: u64) -> &mut Self {
+        self.buf.extend_from_slice(&v.to_le_bytes());
+        self
+    }
+
+    pub fn uint(&mut self, v: u64, width: usize) -> &mut Self {
+        let b = v.to_le_bytes();
+        for i in 0..width {
+            self.buf.push(b.get(i).copied().unwrap_or(0));
+        }
+        self
+    }
+
+    pub fn bytes(&mut self, v: &[u8]) -> &mut Self {
+        self.buf.extend_from_slice(v);
+        self
+    }
+
+    pub fn zeros(&mut self, n: usize) -> &mut Self {
+        self.buf.resize(self.buf.len() + n, 0);
+        self
+    }
+
+    /// Write an address in the configured offset width
+    /// (`u64::MAX` writes the all-ones undefined address).
+    pub fn offset(&mut self, v: u64) -> &mut Self {
+        let w = self.sizes.offset as usize;
+        if v == u64::MAX {
+            self.buf.resize(self.buf.len() + w, 0xff);
+            self
+        } else {
+            self.uint(v, w)
+        }
+    }
+
+    pub fn length(&mut self, v: u64) -> &mut Self {
+        self.uint(v, self.sizes.length as usize)
+    }
+}
+
 /// A tiny deterministic PRNG (xorshift64*) for mutation tests.
 pub(crate) struct Rng(pub u64);
 
@@ -136,7 +214,7 @@ impl Rng {
     }
 
     pub fn below(&mut self, n: usize) -> usize {
-        (self.next() % n as u64) as usize
+        (self.next() % n.max(1) as u64) as usize
     }
 
     /// Apply a few random byte mutations / a random truncation.
@@ -167,4 +245,34 @@ impl Rng {
         }
         d
     }
+}
+
+/// Apply 1..=4 random byte mutations (flip, set, truncate) to a copy.
+pub(crate) fn mutate(rng: &mut Rng, src: &[u8]) -> Vec<u8> {
+    let mut v = src.to_vec();
+    let n = 1 + rng.below(4);
+    for _ in 0..n {
+        if v.is_empty() {
+            break;
+        }
+        match rng.below(6) {
+            0 => {
+                let len = rng.below(v.len());
+                v.truncate(len);
+            }
+            1 => {
+                let i = rng.below(v.len());
+                v[i] = 0xff;
+            }
+            2 => {
+                let i = rng.below(v.len());
+                v[i] = 0;
+            }
+            _ => {
+                let i = rng.below(v.len());
+                v[i] ^= 1 << rng.below(8);
+            }
+        }
+    }
+    v
 }
