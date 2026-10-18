@@ -7,7 +7,7 @@
 use std::cmp::Ordering;
 use std::collections::HashSet;
 
-use super::{ByteReader, Sizes, UNDEFINED_ADDRESS};
+use super::{ByteReader, ByteWriter, Sizes, UNDEFINED_ADDRESS};
 use crate::error::{Error, Result};
 use crate::io::ReadAt;
 
@@ -405,6 +405,44 @@ pub fn find_chunk(
     }
 }
 
+impl BTreeNode {
+    /// Size of a group (type 0) node with room for `2 * k` children.
+    pub fn group_node_size(sizes: Sizes, k: u16) -> usize {
+        let k2 = 2 * usize::from(k);
+        header_size(sizes) + (k2 + 1) * sizes.length as usize + k2 * sizes.offset as usize
+    }
+
+    /// Encode a group (type 0) node at its full size for group internal
+    /// node K `k` (unused key/child slots are zero).
+    pub fn encode_group(&self, sizes: Sizes, k: u16) -> Result<Vec<u8>> {
+        let Keys::Group(keys) = &self.keys else {
+            return Err(Error::unsupported("encoding chunk B-tree nodes"));
+        };
+        if self.node_type != NodeType::Group
+            || keys.len() != self.children.len() + 1
+            || self.children.len() > 2 * usize::from(k)
+        {
+            return Err(Error::invalid("malformed group B-tree node"));
+        }
+        let mut w = ByteWriter::with_sizes(sizes);
+        w.bytes(&BTREE_V1_SIGNATURE)
+            .u8(0)
+            .u8(self.level)
+            .u16(self.children.len() as u16);
+        w.write_offset(self.left_sibling)?;
+        w.write_offset(self.right_sibling)?;
+        for (key, child) in keys.iter().zip(&self.children) {
+            w.write_length(*key)?;
+            w.write_offset(*child)?;
+        }
+        if let Some(last) = keys.last() {
+            w.write_length(*last)?;
+        }
+        w.zeros(Self::group_node_size(sizes, k) - w.len());
+        Ok(w.into_vec())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -586,5 +624,22 @@ mod tests {
             let r = rng.below(50) as u64;
             let _ = find_chunk(&d, 0, Sizes::DEFAULT, &[10, 10], &[r, 49 - r]);
         }
+    }
+
+    #[test]
+    fn encode_group_round_trip() {
+        let sizes = Sizes::DEFAULT;
+        let node = BTreeNode {
+            node_type: NodeType::Group,
+            level: 0,
+            left_sibling: UNDEFINED_ADDRESS,
+            right_sibling: 4000,
+            keys: Keys::Group(vec![0, 8, 24]),
+            children: vec![1000, 2000],
+        };
+        let enc = node.encode_group(sizes, 16).unwrap();
+        assert_eq!(enc.len(), 544);
+        assert_eq!(BTreeNode::parse(&enc, sizes, 0).unwrap(), node);
+        assert!(node.encode_group(sizes, 0).is_err());
     }
 }

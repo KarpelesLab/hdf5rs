@@ -1,7 +1,7 @@
 //! Symbol Table Node (spec: "Disk Format: Level 1B - Group Symbol Table
 //! Nodes"), the leaves of an old-style group's v1 B-tree.
 
-use super::{ByteReader, Sizes, SymbolTableEntry};
+use super::{ByteReader, ByteWriter, Sizes, SymbolTableEntry};
 use crate::error::{Error, Result};
 use crate::io::ReadAt;
 
@@ -61,6 +61,31 @@ impl SymbolTableNode {
     }
 }
 
+impl SymbolTableNode {
+    /// Size of a node holding up to `2 * leaf_k` entries.
+    pub fn node_size(sizes: Sizes, leaf_k: u16) -> usize {
+        HEADER_SIZE + 2 * usize::from(leaf_k) * SymbolTableEntry::encoded_size(sizes.offset)
+    }
+
+    /// Encode the node at its full size for group leaf node K `leaf_k`
+    /// (unused entry slots are zero).
+    pub fn encode(&self, sizes: Sizes, leaf_k: u16) -> Result<Vec<u8>> {
+        if self.entries.len() > 2 * usize::from(leaf_k) {
+            return Err(Error::invalid("too many entries for a symbol table node"));
+        }
+        let mut w = ByteWriter::with_sizes(sizes);
+        w.bytes(&SYMBOL_TABLE_NODE_SIGNATURE)
+            .u8(1)
+            .u8(0)
+            .u16(self.entries.len() as u16);
+        for e in &self.entries {
+            e.encode(&mut w)?;
+        }
+        w.zeros(Self::node_size(sizes, leaf_k) - w.len());
+        Ok(w.into_vec())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -117,5 +142,31 @@ mod tests {
             let d = rng.mutate(&f.data);
             let _ = SymbolTableNode::read(&d, 0, Sizes::DEFAULT);
         }
+    }
+
+    #[test]
+    fn encode_round_trip() {
+        let sizes = Sizes::DEFAULT;
+        let node = SymbolTableNode {
+            version: 1,
+            entries: vec![
+                SymbolTableEntry {
+                    link_name_offset: 8,
+                    object_header_address: 800,
+                    scratch: ScratchPad::None,
+                },
+                SymbolTableEntry {
+                    link_name_offset: 16,
+                    object_header_address: crate::format::UNDEFINED_ADDRESS,
+                    scratch: ScratchPad::SoftLink {
+                        link_value_offset: 24,
+                    },
+                },
+            ],
+        };
+        let enc = node.encode(sizes, 4).unwrap();
+        assert_eq!(enc.len(), 8 + 8 * 40);
+        assert_eq!(SymbolTableNode::parse(&enc, sizes).unwrap(), node);
+        assert!(node.encode(sizes, 0).is_err());
     }
 }

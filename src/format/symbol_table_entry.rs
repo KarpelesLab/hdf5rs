@@ -1,4 +1,4 @@
-use super::ByteReader;
+use super::{ByteReader, ByteWriter};
 use crate::error::{Error, Result};
 
 /// Cached information held in a symbol table entry's scratch-pad space.
@@ -71,6 +71,37 @@ impl SymbolTableEntry {
     }
 }
 
+impl SymbolTableEntry {
+    /// Append the encoded entry (40 bytes with 8-byte offsets).
+    pub fn encode(&self, w: &mut ByteWriter) -> Result<()> {
+        w.write_offset(self.link_name_offset)?;
+        w.write_offset(self.object_header_address)?;
+        let start = w.len();
+        match self.scratch {
+            ScratchPad::None => {
+                w.u32(0).u32(0);
+            }
+            ScratchPad::Group {
+                btree_address,
+                heap_address,
+            } => {
+                w.u32(1).u32(0);
+                w.write_offset(btree_address)?;
+                w.write_offset(heap_address)?;
+            }
+            ScratchPad::SoftLink { link_value_offset } => {
+                w.u32(2).u32(0).u32(link_value_offset);
+            }
+        }
+        let used = w.len() - start;
+        if used > 24 {
+            return Err(Error::invalid("symbol table entry scratch pad overflow"));
+        }
+        w.zeros(24 - used);
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -94,5 +125,45 @@ mod tests {
                 heap_address: 680
             }
         );
+    }
+}
+
+#[cfg(test)]
+mod encode_tests {
+    use super::*;
+    use crate::format::Sizes;
+
+    #[test]
+    fn encode_round_trip() {
+        for sizes in [
+            Sizes::DEFAULT,
+            Sizes {
+                offset: 4,
+                length: 4,
+            },
+        ] {
+            for scratch in [
+                ScratchPad::None,
+                ScratchPad::Group {
+                    btree_address: 1,
+                    heap_address: 2,
+                },
+                ScratchPad::SoftLink {
+                    link_value_offset: 24,
+                },
+            ] {
+                let e = SymbolTableEntry {
+                    link_name_offset: 8,
+                    object_header_address: 96,
+                    scratch,
+                };
+                let mut w = ByteWriter::with_sizes(sizes);
+                e.encode(&mut w).unwrap();
+                assert_eq!(w.len(), SymbolTableEntry::encoded_size(sizes.offset));
+                let data = w.into_vec();
+                let mut r = ByteReader::with_sizes(&data, sizes);
+                assert_eq!(SymbolTableEntry::parse(&mut r).unwrap(), e);
+            }
+        }
     }
 }

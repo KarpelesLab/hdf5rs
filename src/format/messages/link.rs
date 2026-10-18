@@ -2,7 +2,7 @@
 
 use super::until_nul;
 use crate::error::{Error, Result};
-use crate::format::{ByteReader, Sizes};
+use crate::format::{ByteReader, ByteWriter, Sizes};
 
 /// Character set of a link name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -151,6 +151,88 @@ fn parse_external(value: &[u8]) -> Result<LinkTarget> {
     })
 }
 
+impl LinkMessage {
+    /// Encode the message body (version 1).
+    ///
+    /// The name-length field uses the smallest sufficient width; the
+    /// character set field is only written for UTF-8 names and the link
+    /// type field only for non-hard links.
+    pub fn encode(&self, sizes: Sizes) -> Result<Vec<u8>> {
+        let name = self.name.as_bytes();
+        if name.is_empty() {
+            return Err(Error::invalid("empty link name"));
+        }
+        let (size_bits, width) = match name.len() {
+            0..=0xff => (0u8, 1usize),
+            0x100..=0xffff => (1, 2),
+            0x1_0000..=0xffff_ffff => (2, 4),
+            _ => (3, 8),
+        };
+        let (link_type, value): (u8, Option<Vec<u8>>) = match &self.target {
+            LinkTarget::Hard { .. } => (0, None),
+            LinkTarget::Soft { path } => (LINK_TYPE_SOFT, Some(path.as_bytes().to_vec())),
+            LinkTarget::External {
+                version,
+                flags,
+                file,
+                path,
+            } => {
+                if file.as_bytes().contains(&0) || path.as_bytes().contains(&0) {
+                    return Err(Error::invalid("external link value contains NUL"));
+                }
+                let mut v = vec![(version & 0x0f) << 4 | (flags & 0x0f)];
+                v.extend_from_slice(file.as_bytes());
+                v.push(0);
+                v.extend_from_slice(path.as_bytes());
+                v.push(0);
+                (LINK_TYPE_EXTERNAL, Some(v))
+            }
+            LinkTarget::UserDefined { link_type, data } => {
+                if *link_type == 0 {
+                    return Err(Error::invalid("user-defined link with type 0"));
+                }
+                (*link_type, Some(data.clone()))
+            }
+        };
+        let utf8 = self.char_set == CharSet::Utf8;
+        let mut flags = size_bits;
+        if self.creation_order.is_some() {
+            flags |= 0x04;
+        }
+        if link_type != 0 {
+            flags |= 0x08;
+        }
+        if utf8 {
+            flags |= 0x10;
+        }
+        let mut w = ByteWriter::with_sizes(sizes);
+        w.u8(1).u8(flags);
+        if link_type != 0 {
+            w.u8(link_type);
+        }
+        if let Some(c) = self.creation_order {
+            w.u64(c);
+        }
+        if utf8 {
+            w.u8(1);
+        }
+        w.write_uint(name.len() as u64, width)?;
+        w.bytes(name);
+        match (&self.target, value) {
+            (LinkTarget::Hard { address }, _) => {
+                w.write_offset(*address)?;
+            }
+            (_, Some(v)) => {
+                let len = u16::try_from(v.len())
+                    .map_err(|_| Error::LimitExceeded("link value longer than 65535 bytes"))?;
+                w.u16(len).bytes(&v);
+            }
+            (_, None) => return Err(Error::invalid("link value missing")),
+        }
+        Ok(w.into_vec())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -256,5 +338,64 @@ mod tests {
         let mut w = W::new();
         w.u8(1).u8(0x03).u64(u64::MAX);
         assert!(LinkMessage::parse(&w.buf, Sizes::DEFAULT).is_err());
+    }
+
+    #[test]
+    fn encode_round_trip() {
+        let long = "n".repeat(300);
+        let cases = [
+            LinkMessage {
+                creation_order: None,
+                char_set: CharSet::Ascii,
+                name: "data".into(),
+                target: LinkTarget::Hard { address: 4096 },
+            },
+            LinkMessage {
+                creation_order: Some(5),
+                char_set: CharSet::Utf8,
+                name: "d\u{e9}j\u{e0}".into(),
+                target: LinkTarget::Soft {
+                    path: "/a/b".into(),
+                },
+            },
+            LinkMessage {
+                creation_order: None,
+                char_set: CharSet::Ascii,
+                name: long,
+                target: LinkTarget::External {
+                    version: 0,
+                    flags: 0,
+                    file: "other.h5".into(),
+                    path: "/x".into(),
+                },
+            },
+            LinkMessage {
+                creation_order: None,
+                char_set: CharSet::Ascii,
+                name: "u".into(),
+                target: LinkTarget::UserDefined {
+                    link_type: 99,
+                    data: vec![1, 2],
+                },
+            },
+        ];
+        let s4 = Sizes {
+            offset: 4,
+            length: 4,
+        };
+        for sizes in [Sizes::DEFAULT, s4] {
+            for m in &cases {
+                let enc = m.encode(sizes).unwrap();
+                assert_eq!(&LinkMessage::parse(&enc, sizes).unwrap(), m);
+            }
+        }
+        // Matches the reference library's encoding of a plain hard link.
+        assert_eq!(
+            cases[0].encode(Sizes::DEFAULT).unwrap(),
+            [1, 0, 4, b'd', b'a', b't', b'a', 0, 0x10, 0, 0, 0, 0, 0, 0]
+        );
+        let mut bad = cases[0].clone();
+        bad.name.clear();
+        assert!(bad.encode(s4).is_err());
     }
 }

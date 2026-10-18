@@ -1,7 +1,7 @@
 //! Group Info message (type 0x000A, spec IV.A.2.k).
 
 use crate::error::{Error, Result};
-use crate::format::{ByteReader, Sizes};
+use crate::format::{ByteReader, ByteWriter, Sizes};
 
 /// Constant settings of a new-style group.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,6 +60,22 @@ impl GroupInfoMessage {
     }
 }
 
+impl GroupInfoMessage {
+    /// Encode the message body.
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut w = ByteWriter::new();
+        w.u8(0).u8(u8::from(self.link_phase_change.is_some())
+            | u8::from(self.estimated_entries.is_some()) << 1);
+        if let Some((max_compact, min_dense)) = self.link_phase_change {
+            w.u16(max_compact).u16(min_dense);
+        }
+        if let Some((entries, name_len)) = self.estimated_entries {
+            w.u16(entries).u16(name_len);
+        }
+        Ok(w.into_vec())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -77,5 +93,31 @@ mod tests {
         assert!(GroupInfoMessage::parse(&d[..9], Sizes::DEFAULT).is_err());
         assert!(GroupInfoMessage::parse(&[1, 0], Sizes::DEFAULT).is_err());
         assert!(GroupInfoMessage::parse(&[0, 4], Sizes::DEFAULT).is_err());
+    }
+
+    #[test]
+    fn encode_round_trip() {
+        for m in [
+            GroupInfoMessage {
+                link_phase_change: None,
+                estimated_entries: None,
+            },
+            GroupInfoMessage {
+                link_phase_change: Some((100, 50)),
+                estimated_entries: None,
+            },
+            GroupInfoMessage {
+                link_phase_change: Some((8, 6)),
+                estimated_entries: Some((4, 16)),
+            },
+        ] {
+            let enc = m.encode().unwrap();
+            assert_eq!(GroupInfoMessage::parse(&enc, Sizes::DEFAULT).unwrap(), m);
+        }
+        let empty = GroupInfoMessage {
+            link_phase_change: None,
+            estimated_entries: None,
+        };
+        assert_eq!(empty.encode().unwrap(), [0, 0]);
     }
 }

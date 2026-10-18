@@ -41,3 +41,23 @@ jobs:
       - run: cargo doc --no-deps --all-features
         env:
           RUSTDOCFLAGS: -D warnings
+
+  interop:
+    name: interop (files written by hdf5rs, read by h5py)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install h5py numpy
+      - run: |
+          set -e
+          out="$RUNNER_TEMP/written"
+          mkdir -p "$out"
+          cargo run --example write_demo -- "$out/v2.h5" v2
+          cargo run --example write_demo -- "$out/v3.h5" v3
+          cargo run --example write_demo -- "$out/o4.h5" v3 o4 times
+          cargo run --example write_demo -- "$out/v0.h5" v0
+          python tools/check_written.py "$out"/*.h5

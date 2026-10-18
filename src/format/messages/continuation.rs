@@ -1,7 +1,7 @@
 //! Object Header Continuation message (type 0x0010, spec IV.A.2.q).
 
 use crate::error::Result;
-use crate::format::{ByteReader, Sizes};
+use crate::format::{ByteReader, ByteWriter, Sizes};
 
 /// Points at a further block of object header messages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,6 +24,16 @@ impl ContinuationMessage {
     }
 }
 
+impl ContinuationMessage {
+    /// Encode the message body.
+    pub fn encode(&self, sizes: Sizes) -> Result<Vec<u8>> {
+        let mut w = ByteWriter::with_sizes(sizes);
+        w.write_offset(self.offset)?;
+        w.write_length(self.length)?;
+        Ok(w.into_vec())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -41,5 +51,21 @@ mod tests {
         assert_eq!(m.offset, 1000);
         assert_eq!(m.length, 200);
         assert!(ContinuationMessage::parse(&w.buf[..5], s).is_err());
+    }
+
+    #[test]
+    fn encode_round_trip() {
+        let m = ContinuationMessage {
+            offset: 1000,
+            length: 64,
+        };
+        let s = Sizes {
+            offset: 4,
+            length: 2,
+        };
+        assert_eq!(
+            ContinuationMessage::parse(&m.encode(s).unwrap(), s).unwrap(),
+            m
+        );
     }
 }

@@ -99,6 +99,21 @@
 //! assert_eq!(ds.read_values()?[1], Value::Int(-20));
 //! # Ok::<(), hdf5rs::Error>(())
 //! ```
+//!
+//! # Writing a file
+//!
+//! See the [`write`](mod@write) module for details and supported features.
+//!
+//! ```no_run
+//! use hdf5rs::write::FileWriter;
+//!
+//! let mut f = FileWriter::create("out.h5")?;
+//! let mut root = f.root();
+//! root.set_attr("title", "example")?;
+//! root.new_dataset::<f32>("values").shape(&[2, 2]).write(&[1.0, 2.0, 3.0, 4.0])?;
+//! f.finish()?;
+//! # Ok::<(), hdf5rs::Error>(())
+//! ```
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -117,6 +132,7 @@ mod object;
 pub mod read;
 mod reader;
 pub mod types;
+pub mod write;
 
 pub use attribute::Attribute;
 pub use dataset::{Dataset, ExternalFile, NamedDatatype};

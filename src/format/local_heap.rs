@@ -6,7 +6,7 @@
 
 use std::borrow::Cow;
 
-use super::{ByteReader, Sizes, UNDEFINED_ADDRESS};
+use super::{ByteReader, ByteWriter, Sizes, UNDEFINED_ADDRESS};
 use crate::error::{Error, Result};
 use crate::io::ReadAt;
 
@@ -154,6 +154,32 @@ impl LocalHeap {
     }
 }
 
+impl LocalHeap {
+    /// Encode a local heap header (`HEAP`, version 0) whose data segment
+    /// of `data_segment_size` bytes is at `data_segment_address`; a free
+    /// list head of `None` is written as the undefined address.
+    pub fn encode_header(
+        data_segment_size: u64,
+        free_list_head: Option<u64>,
+        data_segment_address: u64,
+        sizes: Sizes,
+    ) -> Result<Vec<u8>> {
+        let mut w = ByteWriter::with_sizes(sizes);
+        w.bytes(&LOCAL_HEAP_SIGNATURE).u8(0).zeros(3);
+        w.write_length(data_segment_size)?;
+        match free_list_head {
+            Some(h) => {
+                w.write_length(h)?;
+            }
+            None => {
+                w.write_length_or_unlimited(u64::MAX)?;
+            }
+        }
+        w.write_offset(data_segment_address)?;
+        Ok(w.into_vec())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -251,5 +277,24 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn encode_header_round_trip() {
+        let sizes = Sizes::DEFAULT;
+        let mut file = LocalHeap::encode_header(16, None, 32, sizes).unwrap();
+        assert_eq!(file.len(), LocalHeap::header_size(sizes));
+        file.resize(32, 0);
+        file.extend_from_slice(b"\0\0\0\0\0\0\0\0abc\0\0\0\0\0");
+        let heap = LocalHeap::read(&file, 0, sizes).unwrap();
+        assert_eq!(heap.free_list_head, None);
+        assert_eq!(heap.get_str(8).unwrap(), "abc");
+        let h = LocalHeap::encode_header(16, Some(8), 32, sizes).unwrap();
+        let mut file = h;
+        file.resize(48, 0);
+        assert_eq!(
+            LocalHeap::read(&file, 0, sizes).unwrap().free_list_head,
+            Some(8)
+        );
     }
 }

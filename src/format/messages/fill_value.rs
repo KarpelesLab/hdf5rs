@@ -4,7 +4,7 @@
 //! "IV.A.2.f. The Data Storage - Fill Value Message", versions 1-3.
 
 use crate::error::{Error, Result};
-use crate::format::{ByteReader, Sizes};
+use crate::format::{ByteReader, ByteWriter, Sizes};
 
 /// The deprecated fill value message (type 0x0004).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -171,6 +171,100 @@ impl FillValue {
     }
 }
 
+fn alloc_time_raw(t: AllocTime) -> u8 {
+    match t {
+        AllocTime::Unspecified => 0,
+        AllocTime::Early => 1,
+        AllocTime::Late => 2,
+        AllocTime::Incremental => 3,
+    }
+}
+
+fn write_time_raw(t: FillWriteTime) -> u8 {
+    match t {
+        FillWriteTime::OnAlloc => 0,
+        FillWriteTime::Never => 1,
+        FillWriteTime::IfSet => 2,
+    }
+}
+
+impl OldFillValue {
+    /// Encode the message body.
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let len = u32::try_from(self.value.len())
+            .map_err(|_| Error::LimitExceeded("fill value larger than 4 GiB"))?;
+        let mut w = ByteWriter::new();
+        w.u32(len).bytes(&self.value);
+        Ok(w.into_vec())
+    }
+}
+
+impl FillValue {
+    /// A version 3 fill value message with the given allocation time,
+    /// "write if set" behaviour and an optional defined value (`None`
+    /// leaves the library default of zero bytes).
+    pub fn new_v3(alloc_time: AllocTime, value: Option<Vec<u8>>) -> FillValue {
+        FillValue {
+            version: 3,
+            alloc_time,
+            write_time: FillWriteTime::IfSet,
+            state: if value.is_some() {
+                FillValueState::Defined
+            } else {
+                FillValueState::Default
+            },
+            value,
+        }
+    }
+
+    /// Encode the message body (versions 1-3, as given by `version`).
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut w = ByteWriter::new();
+        let write_value = |w: &mut ByteWriter, v: &Option<Vec<u8>>| -> Result<()> {
+            let v = v.as_deref().unwrap_or(&[]);
+            let len = u32::try_from(v.len())
+                .map_err(|_| Error::LimitExceeded("fill value larger than 4 GiB"))?;
+            w.u32(len).bytes(v);
+            Ok(())
+        };
+        match self.version {
+            1 | 2 => {
+                let defined = match self.state {
+                    FillValueState::Defined => true,
+                    FillValueState::Default => false,
+                    FillValueState::Undefined => {
+                        return Err(Error::invalid("undefined fill value needs version 3"));
+                    }
+                };
+                w.u8(self.version)
+                    .u8(alloc_time_raw(self.alloc_time))
+                    .u8(write_time_raw(self.write_time))
+                    .u8(u8::from(defined));
+                if self.version == 1 || defined {
+                    write_value(&mut w, &self.value)?;
+                }
+            }
+            3 => {
+                let state = match self.state {
+                    FillValueState::Default => 0,
+                    FillValueState::Undefined => 0x10,
+                    FillValueState::Defined => 0x20,
+                };
+                w.u8(3).u8(alloc_time_raw(self.alloc_time)
+                    | write_time_raw(self.write_time) << 2
+                    | state);
+                if self.state == FillValueState::Defined {
+                    write_value(&mut w, &self.value)?;
+                } else if self.value.is_some() {
+                    return Err(Error::invalid("fill value bytes given but not defined"));
+                }
+            }
+            v => return Err(Error::unsupported(format!("fill value version {v}"))),
+        }
+        Ok(w.into_vec())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -254,5 +348,51 @@ mod tests {
             let _ = FillValue::parse(&v, S);
             let _ = OldFillValue::parse(&v, S);
         }
+    }
+
+    #[test]
+    fn encode_round_trip() {
+        let cases = [
+            FillValue::new_v3(AllocTime::Late, None),
+            FillValue::new_v3(AllocTime::Early, Some(vec![1, 2, 3, 4])),
+            FillValue {
+                state: FillValueState::Undefined,
+                ..FillValue::new_v3(AllocTime::Incremental, None)
+            },
+            FillValue {
+                version: 2,
+                alloc_time: AllocTime::Late,
+                write_time: FillWriteTime::OnAlloc,
+                state: FillValueState::Defined,
+                value: Some(vec![9; 8]),
+            },
+            FillValue {
+                version: 2,
+                alloc_time: AllocTime::Early,
+                write_time: FillWriteTime::Never,
+                state: FillValueState::Default,
+                value: None,
+            },
+            FillValue {
+                version: 1,
+                alloc_time: AllocTime::Unspecified,
+                write_time: FillWriteTime::IfSet,
+                state: FillValueState::Default,
+                value: Some(vec![5, 6]),
+            },
+        ];
+        for fv in &cases {
+            let enc = fv.encode().unwrap();
+            assert_eq!(&FillValue::parse(&enc, Sizes::DEFAULT).unwrap(), fv);
+        }
+        assert_eq!(
+            FillValue::new_v3(AllocTime::Late, None).encode().unwrap(),
+            [3, 0x0a]
+        );
+        let old = OldFillValue { value: vec![1, 2] };
+        assert_eq!(
+            OldFillValue::parse(&old.encode().unwrap(), Sizes::DEFAULT).unwrap(),
+            old
+        );
     }
 }

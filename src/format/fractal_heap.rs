@@ -30,7 +30,7 @@
 //! (i.e. counting the block's own header).
 
 use super::btree_v2::{BTreeV2, Record, RecordContext};
-use super::{ByteReader, Sizes, UNDEFINED_ADDRESS};
+use super::{ByteReader, ByteWriter, Sizes, UNDEFINED_ADDRESS};
 use crate::checksum::metadata_checksum;
 use crate::error::{Error, Result};
 use crate::io::ReadAt;
@@ -841,6 +841,53 @@ impl FractalHeap {
         let mut r = ByteReader::with_sizes(data, self.sizes);
         r.expect_signature(b"FHDB")?;
         self.check_block_prefix(&mut r, block_offset, "direct")
+    }
+}
+
+impl FractalHeapHeader {
+    /// Encode the header (`FRHP` through checksum).
+    pub fn encode(&self, sizes: Sizes) -> Result<Vec<u8>> {
+        if usize::from(self.io_filter_len) != self.filter_info.len() {
+            return Err(Error::invalid("fractal heap filter info length mismatch"));
+        }
+        let mut w = ByteWriter::with_sizes(sizes);
+        w.bytes(b"FRHP")
+            .u8(0)
+            .u16(self.heap_id_len)
+            .u16(self.io_filter_len)
+            .u8(self.flags)
+            .u32(self.max_managed_object_size);
+        w.write_length(self.next_huge_id)?;
+        w.write_offset(self.huge_btree_address)?;
+        w.write_length(self.free_space)?;
+        w.write_offset(self.free_space_manager_address)?;
+        w.write_length(self.managed_space)?;
+        w.write_length(self.allocated_managed_space)?;
+        w.write_length(self.direct_block_iterator_offset)?;
+        w.write_length(self.managed_object_count)?;
+        w.write_length(self.huge_object_size)?;
+        w.write_length(self.huge_object_count)?;
+        w.write_length(self.tiny_object_size)?;
+        w.write_length(self.tiny_object_count)?;
+        w.u16(self.table_width);
+        w.write_length(self.starting_block_size)?;
+        w.write_length(self.max_direct_block_size)?;
+        w.u16(self.max_heap_size_bits).u16(self.starting_root_rows);
+        w.write_offset(self.root_address)?;
+        w.u16(self.current_root_rows);
+        if self.io_filter_len > 0 {
+            w.write_length(self.filtered_root_size.unwrap_or(0))?;
+            w.u32(self.root_filter_mask.unwrap_or(0));
+            w.bytes(&self.filter_info);
+        }
+        let sum = metadata_checksum(w.as_slice());
+        w.u32(sum);
+        Ok(w.into_vec())
+    }
+
+    /// Encoded size of an unfiltered header.
+    pub fn encoded_size(sizes: Sizes) -> usize {
+        Self::fixed_len(sizes) + 4
     }
 }
 

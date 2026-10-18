@@ -5,7 +5,7 @@
 use super::dataspace::Dataspace;
 use super::datatype::{CharacterSet, Datatype};
 use crate::error::{Error, Result};
-use crate::format::{ByteReader, Sizes};
+use crate::format::{ByteReader, ByteWriter, Sizes};
 
 /// A message field that is either encoded inline or as a shared-message
 /// reference.
@@ -122,6 +122,101 @@ impl Attribute {
             dataspace,
             data,
         })
+    }
+}
+
+/// Write a field, padded to 8 bytes in version 1.
+fn put_field(w: &mut ByteWriter, bytes: &[u8], version: u8) {
+    w.bytes(bytes);
+    if version == 1 {
+        w.zeros(bytes.len().next_multiple_of(8) - bytes.len());
+    }
+}
+
+impl Attribute {
+    /// A version 3 attribute with an inline datatype and dataspace; the
+    /// name character set is ASCII for ASCII names, UTF-8 otherwise.
+    pub fn new_v3(name: &str, datatype: Datatype, dataspace: Dataspace, data: Vec<u8>) -> Self {
+        Attribute {
+            version: 3,
+            name: name.to_owned(),
+            name_charset: if name.is_ascii() {
+                CharacterSet::Ascii
+            } else {
+                CharacterSet::Utf8
+            },
+            datatype: MaybeShared::Inline(datatype),
+            dataspace: MaybeShared::Inline(dataspace),
+            data,
+        }
+    }
+
+    /// Encode the message body (versions 1-3, as given by `version`).
+    ///
+    /// Shared fields are written verbatim with the matching flag bit.
+    /// For inline fields the data must be exactly `element count * size`
+    /// bytes.
+    pub fn encode(&self, sizes: Sizes) -> Result<Vec<u8>> {
+        let version = self.version;
+        if !(1..=3).contains(&version) {
+            return Err(Error::unsupported(format!("attribute version {version}")));
+        }
+        if self.name.is_empty() || self.name.as_bytes().contains(&0) {
+            return Err(Error::invalid("attribute name is empty or contains NUL"));
+        }
+        if version < 3 && self.name_charset != CharacterSet::Ascii {
+            return Err(Error::invalid("UTF-8 attribute names need version 3"));
+        }
+        let mut name = self.name.as_bytes().to_vec();
+        name.push(0);
+        let mut flags = 0u8;
+        let dt = match &self.datatype {
+            MaybeShared::Inline(dt) => dt.encode()?,
+            MaybeShared::Shared(raw) => {
+                flags |= 1;
+                raw.clone()
+            }
+        };
+        let ds = match &self.dataspace {
+            MaybeShared::Inline(ds) => ds.encode(sizes)?,
+            MaybeShared::Shared(raw) => {
+                flags |= 2;
+                raw.clone()
+            }
+        };
+        if version == 1 && flags != 0 {
+            return Err(Error::invalid("shared attribute fields need version 2+"));
+        }
+        if let (MaybeShared::Inline(dt), MaybeShared::Inline(ds)) =
+            (&self.datatype, &self.dataspace)
+        {
+            let expect = ds.element_count()?.checked_mul(u64::from(dt.size));
+            if expect != Some(self.data.len() as u64) {
+                return Err(Error::invalid(
+                    "attribute data size does not match its type",
+                ));
+            }
+        }
+        let len16 = |n: usize| {
+            u16::try_from(n).map_err(|_| Error::LimitExceeded("attribute field over 65535 bytes"))
+        };
+        let mut w = ByteWriter::with_sizes(sizes);
+        w.u8(version)
+            .u8(flags)
+            .u16(len16(name.len())?)
+            .u16(len16(dt.len())?)
+            .u16(len16(ds.len())?);
+        if version >= 3 {
+            w.u8(match self.name_charset {
+                CharacterSet::Ascii => 0,
+                CharacterSet::Utf8 => 1,
+            });
+        }
+        put_field(&mut w, &name, version);
+        put_field(&mut w, &dt, version);
+        put_field(&mut w, &ds, version);
+        w.bytes(&self.data);
+        Ok(w.into_vec())
     }
 }
 
@@ -259,5 +354,52 @@ mod tests {
             m.truncate((rnd() % (m.len() as u64 + 1)) as usize);
             let _ = Attribute::parse(&m, S);
         }
+    }
+
+    #[test]
+    fn encode_round_trip() {
+        use crate::format::messages::datatype::ByteOrder;
+        let i32le = Datatype::integer(4, true, ByteOrder::LittleEndian);
+        let mut cases = vec![
+            Attribute::new_v3(
+                "temp\u{e9}rature",
+                i32le.clone(),
+                Dataspace::simple(&[2], None),
+                vec![1, 0, 0, 0, 2, 0, 0, 0],
+            ),
+            Attribute::new_v3("s", i32le.clone(), Dataspace::scalar(), vec![7, 0, 0, 0]),
+            Attribute::new_v3("n", i32le.clone(), Dataspace::null(), vec![]),
+        ];
+        for version in [1, 2] {
+            let mut a = Attribute::new_v3(
+                "units",
+                i32le.clone(),
+                Dataspace::simple(&[1], None),
+                vec![1, 2, 3, 4],
+            );
+            a.version = version;
+            a.name_charset = CharacterSet::Ascii;
+            if version == 1 {
+                a.dataspace = MaybeShared::Inline(Dataspace {
+                    version: 1,
+                    ..Dataspace::simple(&[1], None)
+                });
+            }
+            cases.push(a);
+        }
+        let mut shared = Attribute::new_v3("c", i32le.clone(), Dataspace::scalar(), vec![]);
+        shared.datatype = MaybeShared::Shared(vec![3, 2, 0, 1, 0, 0, 0, 0, 0, 0]);
+        shared.data = vec![9, 9, 9, 9];
+        cases.push(shared);
+        for a in &cases {
+            let enc = a.encode(Sizes::DEFAULT).unwrap();
+            assert_eq!(&Attribute::parse(&enc, Sizes::DEFAULT).unwrap(), a);
+        }
+        let mut bad = cases[0].clone();
+        bad.data.pop();
+        assert!(bad.encode(Sizes::DEFAULT).is_err());
+        let mut bad = cases[0].clone();
+        bad.version = 2;
+        assert!(bad.encode(Sizes::DEFAULT).is_err());
     }
 }

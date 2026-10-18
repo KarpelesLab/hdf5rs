@@ -3,7 +3,7 @@
 //! Spec: "IV.A.2.v. The Attribute Info Message", version 0.
 
 use crate::error::{Error, Result};
-use crate::format::{ByteReader, Sizes};
+use crate::format::{ByteReader, ByteWriter, Sizes};
 
 /// A decoded attribute info message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,6 +54,34 @@ impl AttributeInfo {
     }
 }
 
+impl AttributeInfo {
+    /// Attribute info for compact attribute storage.
+    pub fn compact(creation_order_tracked: bool) -> AttributeInfo {
+        AttributeInfo {
+            max_creation_index: creation_order_tracked.then_some(0),
+            fractal_heap_address: crate::format::UNDEFINED_ADDRESS,
+            name_btree_address: crate::format::UNDEFINED_ADDRESS,
+            creation_order_btree_address: None,
+        }
+    }
+
+    /// Encode the message body.
+    pub fn encode(&self, sizes: Sizes) -> Result<Vec<u8>> {
+        let mut w = ByteWriter::with_sizes(sizes);
+        w.u8(0).u8(u8::from(self.max_creation_index.is_some())
+            | u8::from(self.creation_order_btree_address.is_some()) << 1);
+        if let Some(m) = self.max_creation_index {
+            w.u16(m);
+        }
+        w.write_offset(self.fractal_heap_address)?;
+        w.write_offset(self.name_btree_address)?;
+        if let Some(a) = self.creation_order_btree_address {
+            w.write_offset(a)?;
+        }
+        Ok(w.into_vec())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -89,5 +117,23 @@ mod tests {
         assert!(AttributeInfo::parse(&[], Sizes::DEFAULT).is_err());
         assert!(AttributeInfo::parse(&[1, 0], Sizes::DEFAULT).is_err());
         assert!(AttributeInfo::parse(&[0, 4], Sizes::DEFAULT).is_err());
+    }
+
+    #[test]
+    fn encode_round_trip() {
+        let cases = [
+            AttributeInfo::compact(false),
+            AttributeInfo::compact(true),
+            AttributeInfo {
+                max_creation_index: Some(3),
+                fractal_heap_address: 10,
+                name_btree_address: 20,
+                creation_order_btree_address: Some(30),
+            },
+        ];
+        for m in &cases {
+            let enc = m.encode(Sizes::DEFAULT).unwrap();
+            assert_eq!(&AttributeInfo::parse(&enc, Sizes::DEFAULT).unwrap(), m);
+        }
     }
 }

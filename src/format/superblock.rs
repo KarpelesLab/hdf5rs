@@ -1,7 +1,7 @@
 //! The superblock (spec: "Disk Format: Level 0A - Format Signature and
 //! Superblock") and the optional driver information block ("Level 0B").
 
-use super::{ByteReader, Sizes, SymbolTableEntry, UNDEFINED_ADDRESS};
+use super::{ByteReader, ByteWriter, Sizes, SymbolTableEntry, UNDEFINED_ADDRESS};
 use crate::checksum::metadata_checksum;
 use crate::error::{Error, Result};
 use crate::io::{OffsetReader, ReadAt};
@@ -301,6 +301,141 @@ impl Superblock {
     }
 }
 
+impl Superblock {
+    /// A version 2 or 3 superblock at offset 0 with no extension, as
+    /// written by a fresh file writer.
+    pub fn new_v23(version: u8, sizes: Sizes, root_address: u64, eof_address: u64) -> Superblock {
+        Superblock {
+            version,
+            superblock_offset: 0,
+            sizes,
+            base_address: 0,
+            free_space_version: None,
+            root_entry_version: None,
+            shared_header_version: None,
+            group_leaf_k: None,
+            group_internal_k: None,
+            indexed_storage_k: None,
+            consistency_flags: 0,
+            free_space_address: UNDEFINED_ADDRESS,
+            extension_address: UNDEFINED_ADDRESS,
+            eof_address,
+            driver_info_address: UNDEFINED_ADDRESS,
+            driver_info: None,
+            root: RootGroup::ObjectHeader(root_address),
+        }
+    }
+
+    /// Encoded size of a version 2/3 superblock with the given widths.
+    pub fn encoded_size_v23(sizes: Sizes) -> usize {
+        8 + 1 + 2 + 1 + 4 * sizes.offset as usize + 4
+    }
+
+    /// A version 0 superblock at offset 0 with the default B-tree K values
+    /// (group leaf 4, group internal 16) and no driver information.
+    pub fn new_v0(sizes: Sizes, root: SymbolTableEntry, eof_address: u64) -> Superblock {
+        Superblock {
+            version: 0,
+            superblock_offset: 0,
+            sizes,
+            base_address: 0,
+            free_space_version: Some(0),
+            root_entry_version: Some(0),
+            shared_header_version: Some(0),
+            group_leaf_k: Some(4),
+            group_internal_k: Some(16),
+            indexed_storage_k: None,
+            consistency_flags: 0,
+            free_space_address: UNDEFINED_ADDRESS,
+            extension_address: UNDEFINED_ADDRESS,
+            eof_address,
+            driver_info_address: UNDEFINED_ADDRESS,
+            driver_info: None,
+            root: RootGroup::SymbolTableEntry(root),
+        }
+    }
+
+    /// Encoded size of a version 0 superblock with the given widths.
+    pub fn encoded_size_v0(sizes: Sizes) -> usize {
+        8 + 16 + 4 * sizes.offset as usize + SymbolTableEntry::encoded_size(sizes.offset)
+    }
+
+    fn encode_v01(&self) -> Result<Vec<u8>> {
+        let RootGroup::SymbolTableEntry(root) = self.root else {
+            return Err(Error::invalid(
+                "version 0/1 superblock needs a root symbol table entry",
+            ));
+        };
+        let leaf_k = self.group_leaf_k.unwrap_or(4);
+        let internal_k = self.group_internal_k.unwrap_or(16);
+        if leaf_k == 0 || internal_k == 0 {
+            return Err(Error::invalid("group B-tree K must be non-zero"));
+        }
+        let mut w = ByteWriter::with_sizes(self.sizes);
+        w.bytes(&crate::SIGNATURE)
+            .u8(self.version)
+            .u8(self.free_space_version.unwrap_or(0))
+            .u8(self.root_entry_version.unwrap_or(0))
+            .u8(0)
+            .u8(self.shared_header_version.unwrap_or(0))
+            .u8(self.sizes.offset)
+            .u8(self.sizes.length)
+            .u8(0)
+            .u16(leaf_k)
+            .u16(internal_k)
+            .u32(self.consistency_flags);
+        if self.version == 1 {
+            let k = self
+                .indexed_storage_k
+                .filter(|&k| k > 0)
+                .ok_or_else(|| Error::invalid("superblock v1 needs indexed storage K"))?;
+            w.u16(k).u16(0);
+        }
+        w.write_offset(self.base_address)?;
+        w.write_offset(self.free_space_address)?;
+        w.write_offset(self.eof_address)?;
+        w.write_offset(self.driver_info_address)?;
+        root.encode(&mut w)?;
+        Ok(w.into_vec())
+    }
+
+    /// Encode the superblock, signature through checksum (versions 2/3)
+    /// or root symbol table entry (versions 0/1). A driver information
+    /// block is not written.
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        parse_sizes(self.sizes.offset, self.sizes.length)?;
+        match self.version {
+            0 | 1 => return self.encode_v01(),
+            2 | 3 => {}
+            v => {
+                return Err(Error::unsupported(format!(
+                    "encoding superblock version {v}"
+                )));
+            }
+        }
+        let RootGroup::ObjectHeader(root) = self.root else {
+            return Err(Error::invalid(
+                "version 2/3 superblock needs a root object header address",
+            ));
+        };
+        let flags = u8::try_from(self.consistency_flags)
+            .map_err(|_| Error::invalid("consistency flags do not fit one byte"))?;
+        let mut w = ByteWriter::with_sizes(self.sizes);
+        w.bytes(&crate::SIGNATURE)
+            .u8(self.version)
+            .u8(self.sizes.offset)
+            .u8(self.sizes.length)
+            .u8(flags);
+        w.write_offset(self.base_address)?;
+        w.write_offset(self.extension_address)?;
+        w.write_offset(self.eof_address)?;
+        w.write_offset(root)?;
+        let sum = metadata_checksum(w.as_slice());
+        w.u32(sum);
+        Ok(w.into_vec())
+    }
+}
+
 fn parse_sizes(offset: u8, length: u8) -> Result<Sizes> {
     let ok = |v: u8| matches!(v, 2 | 4 | 8 | 16);
     if !ok(offset) {
@@ -494,6 +629,48 @@ mod tests {
         let sb = Superblock::read(&w.buf).unwrap();
         assert_eq!(sb.sizes.offset, 4);
         assert_eq!(sb.root_object_header_address(), 60);
+    }
+
+    #[test]
+    fn encode_round_trip() {
+        for v in [2, 3] {
+            for sizes in [
+                Sizes::DEFAULT,
+                Sizes {
+                    offset: 4,
+                    length: 2,
+                },
+            ] {
+                let sb = Superblock::new_v23(v, sizes, 48, 4096);
+                let bytes = sb.encode().unwrap();
+                assert_eq!(bytes.len(), Superblock::encoded_size_v23(sizes));
+                assert_eq!(Superblock::read(&bytes).unwrap(), sb);
+            }
+        }
+        assert_eq!(
+            v2_bytes(2),
+            Superblock::read(&v2_bytes(2)).unwrap().encode().unwrap()
+        );
+        for v in [0, 1] {
+            let bytes = v0_bytes(v, u64::MAX);
+            let sb = Superblock::read(&bytes).unwrap();
+            assert_eq!(sb.encode().unwrap(), bytes);
+        }
+        let root = SymbolTableEntry {
+            link_name_offset: 0,
+            object_header_address: 96,
+            scratch: ScratchPad::Group {
+                btree_address: 136,
+                heap_address: 680,
+            },
+        };
+        let sb = Superblock::new_v0(Sizes::DEFAULT, root, 1000);
+        let enc = sb.encode().unwrap();
+        assert_eq!(enc.len(), Superblock::encoded_size_v0(Sizes::DEFAULT));
+        assert_eq!(Superblock::read(&enc).unwrap(), sb);
+        let mut bad = sb.clone();
+        bad.root = RootGroup::ObjectHeader(5);
+        assert!(bad.encode().is_err());
     }
 
     #[test]

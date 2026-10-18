@@ -1,7 +1,7 @@
 //! Link Info message (type 0x0002, spec IV.A.2.c).
 
 use crate::error::{Error, Result};
-use crate::format::{ByteReader, Sizes, UNDEFINED_ADDRESS};
+use crate::format::{ByteReader, ByteWriter, Sizes, UNDEFINED_ADDRESS};
 
 /// Variable state of a new-style group's links.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,6 +61,44 @@ impl LinkInfoMessage {
     }
 }
 
+impl LinkInfoMessage {
+    /// Link info for a group with compact storage (no dense structures).
+    pub fn compact(creation_order_tracked: bool) -> Self {
+        LinkInfoMessage {
+            creation_order_tracked,
+            creation_order_indexed: false,
+            max_creation_index: creation_order_tracked.then_some(0),
+            fractal_heap_address: UNDEFINED_ADDRESS,
+            name_index_address: UNDEFINED_ADDRESS,
+            creation_order_index_address: None,
+        }
+    }
+
+    /// Encode the message body.
+    pub fn encode(&self, sizes: Sizes) -> Result<Vec<u8>> {
+        if self.creation_order_indexed && !self.creation_order_tracked {
+            return Err(Error::invalid(
+                "link creation order indexed but not tracked",
+            ));
+        }
+        if self.creation_order_indexed != self.creation_order_index_address.is_some() {
+            return Err(Error::invalid("creation order index address mismatch"));
+        }
+        let mut w = ByteWriter::with_sizes(sizes);
+        w.u8(0)
+            .u8(u8::from(self.creation_order_tracked) | u8::from(self.creation_order_indexed) << 1);
+        if self.creation_order_tracked {
+            w.u64(self.max_creation_index.unwrap_or(0));
+        }
+        w.write_offset(self.fractal_heap_address)?;
+        w.write_offset(self.name_index_address)?;
+        if let Some(a) = self.creation_order_index_address {
+            w.write_offset(a)?;
+        }
+        Ok(w.into_vec())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -86,5 +124,34 @@ mod tests {
         assert_eq!(m.name_index_address, 200);
         assert_eq!(m.creation_order_index_address, Some(300));
         assert!(LinkInfoMessage::parse(&w.buf[..w.len() - 1], Sizes::DEFAULT).is_err());
+    }
+
+    #[test]
+    fn encode_round_trip() {
+        let s4 = Sizes {
+            offset: 4,
+            length: 4,
+        };
+        let cases = [
+            LinkInfoMessage::compact(false),
+            LinkInfoMessage::compact(true),
+            LinkInfoMessage {
+                creation_order_tracked: true,
+                creation_order_indexed: true,
+                max_creation_index: Some(77),
+                fractal_heap_address: 100,
+                name_index_address: 200,
+                creation_order_index_address: Some(300),
+            },
+        ];
+        for sizes in [Sizes::DEFAULT, s4] {
+            for m in &cases {
+                let enc = m.encode(sizes).unwrap();
+                assert_eq!(&LinkInfoMessage::parse(&enc, sizes).unwrap(), m);
+            }
+        }
+        let mut bad = cases[2];
+        bad.creation_order_index_address = None;
+        assert!(bad.encode(s4).is_err());
     }
 }

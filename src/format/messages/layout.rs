@@ -7,7 +7,7 @@
 //! [`ChunkedLayout::filtered_chunk_size_width`]).
 
 use crate::error::{Error, Result};
-use crate::format::{ByteReader, Sizes};
+use crate::format::{ByteReader, ByteWriter, Sizes};
 
 /// Chunked layout flag (version 4): do not filter partial edge chunks.
 pub const DONT_FILTER_PARTIAL_BOUND_CHUNKS: u8 = 0x01;
@@ -340,6 +340,148 @@ fn parse_v4_chunked(r: &mut ByteReader<'_>, layout_version: u8) -> Result<Chunke
     })
 }
 
+impl DataLayout {
+    /// Encode the message body as layout version `version` (3 or 4; 5 is
+    /// accepted for chunked layouts and encodes like 4).
+    ///
+    /// Compact and contiguous layouts are supported for versions 3-5,
+    /// chunked layouts with a v1 B-tree index for version 3 and with the
+    /// version 4 indexes for versions 4/5, virtual layouts for 4/5.
+    pub fn encode(&self, version: u8, sizes: Sizes) -> Result<Vec<u8>> {
+        if !(3..=5).contains(&version) {
+            return Err(Error::unsupported(format!(
+                "encoding data layout version {version}"
+            )));
+        }
+        let mut w = ByteWriter::with_sizes(sizes);
+        w.u8(version);
+        match self {
+            DataLayout::Compact { data, dims } => {
+                if dims.is_some() {
+                    return Err(Error::invalid("layout dims require version 1/2"));
+                }
+                let len = u16::try_from(data.len())
+                    .map_err(|_| Error::LimitExceeded("compact data larger than 65535 bytes"))?;
+                w.u8(0).u16(len).bytes(data);
+            }
+            DataLayout::Contiguous {
+                address,
+                size,
+                dims,
+            } => {
+                if dims.is_some() {
+                    return Err(Error::invalid("layout dims require version 1/2"));
+                }
+                let size = size.ok_or_else(|| Error::invalid("contiguous layout needs a size"))?;
+                w.u8(1);
+                w.write_offset(*address)?;
+                w.write_length(size)?;
+            }
+            DataLayout::Chunked(c) => encode_chunked(&mut w, c, version)?,
+            DataLayout::Virtual {
+                heap_address,
+                heap_index,
+            } => {
+                if version < 4 {
+                    return Err(Error::invalid("virtual layout requires version 4"));
+                }
+                w.u8(3);
+                w.write_offset(*heap_address)?;
+                w.u32(*heap_index);
+            }
+        }
+        Ok(w.into_vec())
+    }
+}
+
+fn encode_chunked(w: &mut ByteWriter, c: &ChunkedLayout, version: u8) -> Result<()> {
+    let rank = c
+        .dims
+        .len()
+        .checked_add(1)
+        .and_then(|n| u8::try_from(n).ok())
+        .ok_or(Error::LimitExceeded("chunk rank"))?;
+    if c.dims.contains(&0) {
+        return Err(Error::invalid("chunk dimension of size zero"));
+    }
+    w.u8(2);
+    if version == 3 {
+        let ChunkIndex::BTreeV1 { address } = c.index else {
+            return Err(Error::invalid("layout version 3 needs a v1 B-tree index"));
+        };
+        w.u8(rank);
+        w.write_offset(address)?;
+        for &d in c.dims.iter().chain(std::iter::once(&c.element_size)) {
+            let d = u32::try_from(d).map_err(|_| Error::LimitExceeded("chunk dimension"))?;
+            w.u32(d);
+        }
+        return Ok(());
+    }
+    let max = c
+        .dims
+        .iter()
+        .copied()
+        .chain([c.element_size])
+        .max()
+        .unwrap_or(1);
+    let width = ((64 - max.leading_zeros()) as usize).div_ceil(8).max(1);
+    w.u8(c.flags).u8(rank).u8(width as u8);
+    for &d in c.dims.iter().chain(std::iter::once(&c.element_size)) {
+        w.write_uint(d, width)?;
+    }
+    match c.index {
+        ChunkIndex::BTreeV1 { .. } => {
+            return Err(Error::invalid("v1 B-tree index requires layout version 3"));
+        }
+        ChunkIndex::SingleChunk { address, filtered } => {
+            w.u8(1);
+            match (filtered, c.flags & SINGLE_INDEX_WITH_FILTER != 0) {
+                (Some(f), true) => {
+                    w.write_length(f.size)?;
+                    w.u32(f.filter_mask);
+                }
+                (None, false) => {}
+                _ => return Err(Error::invalid("single chunk filter flag mismatch")),
+            }
+            w.write_offset(address)?;
+        }
+        ChunkIndex::Implicit { address } => {
+            w.u8(2);
+            w.write_offset(address)?;
+        }
+        ChunkIndex::FixedArray { address, page_bits } => {
+            w.u8(3).u8(page_bits);
+            w.write_offset(address)?;
+        }
+        ChunkIndex::ExtensibleArray {
+            address,
+            max_bits,
+            index_elements,
+            min_pointers,
+            min_elements,
+            page_bits,
+        } => {
+            w.u8(4)
+                .u8(max_bits)
+                .u8(index_elements)
+                .u8(min_pointers)
+                .u8(min_elements)
+                .u8(page_bits);
+            w.write_offset(address)?;
+        }
+        ChunkIndex::BTreeV2 {
+            address,
+            node_size,
+            split_percent,
+            merge_percent,
+        } => {
+            w.u8(5).u32(node_size).u8(split_percent).u8(merge_percent);
+            w.write_offset(address)?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -599,5 +741,127 @@ mod tests {
             v.truncate((rnd() % (v.len() as u64 + 1)) as usize);
             let _ = DataLayout::parse(&v, S);
         }
+    }
+
+    #[test]
+    fn encode_round_trip() {
+        let chunked = |index, flags, v| {
+            DataLayout::Chunked(ChunkedLayout {
+                dims: vec![4, 300],
+                element_size: 8,
+                flags,
+                index,
+                layout_version: v,
+            })
+        };
+        let cases = [
+            (
+                3,
+                DataLayout::Compact {
+                    data: vec![1, 2, 3],
+                    dims: None,
+                },
+            ),
+            (
+                4,
+                DataLayout::Compact {
+                    data: vec![],
+                    dims: None,
+                },
+            ),
+            (
+                3,
+                DataLayout::Contiguous {
+                    address: 4096,
+                    size: Some(80),
+                    dims: None,
+                },
+            ),
+            (
+                3,
+                DataLayout::Contiguous {
+                    address: crate::format::UNDEFINED_ADDRESS,
+                    size: Some(80),
+                    dims: None,
+                },
+            ),
+            (3, chunked(ChunkIndex::BTreeV1 { address: 99 }, 0, 3)),
+            (
+                4,
+                chunked(
+                    ChunkIndex::SingleChunk {
+                        address: 7,
+                        filtered: Some(FilteredChunk {
+                            size: 10,
+                            filter_mask: 1,
+                        }),
+                    },
+                    SINGLE_INDEX_WITH_FILTER,
+                    4,
+                ),
+            ),
+            (4, chunked(ChunkIndex::Implicit { address: 7 }, 0, 4)),
+            (
+                4,
+                chunked(
+                    ChunkIndex::FixedArray {
+                        address: 7,
+                        page_bits: 10,
+                    },
+                    1,
+                    4,
+                ),
+            ),
+            (
+                5,
+                chunked(
+                    ChunkIndex::ExtensibleArray {
+                        address: 7,
+                        max_bits: 32,
+                        index_elements: 4,
+                        min_pointers: 4,
+                        min_elements: 16,
+                        page_bits: 10,
+                    },
+                    0,
+                    5,
+                ),
+            ),
+            (
+                4,
+                chunked(
+                    ChunkIndex::BTreeV2 {
+                        address: 7,
+                        node_size: 2048,
+                        split_percent: 100,
+                        merge_percent: 40,
+                    },
+                    0,
+                    4,
+                ),
+            ),
+            (
+                4,
+                DataLayout::Virtual {
+                    heap_address: 5,
+                    heap_index: 2,
+                },
+            ),
+        ];
+        for (v, l) in &cases {
+            let enc = l.encode(*v, Sizes::DEFAULT).unwrap();
+            assert_eq!(
+                &DataLayout::parse(&enc, Sizes::DEFAULT).unwrap(),
+                l,
+                "{l:?}"
+            );
+        }
+        let big = DataLayout::Compact {
+            data: vec![0; 70000],
+            dims: None,
+        };
+        assert!(big.encode(3, Sizes::DEFAULT).is_err());
+        assert!(cases[0].1.encode(2, Sizes::DEFAULT).is_err());
+        assert!(cases[10].1.encode(3, Sizes::DEFAULT).is_err());
     }
 }

@@ -38,5 +38,21 @@ and `files.txt` together): tests run against the checked-in corpus and do not
 need Python. Keep each fixture small (ideally < 64 KiB) and the whole corpus
 well under 3 MiB.
 
+## `check_written.py` — files written by hdf5rs, read by h5py
+
+Black-box interoperability check of the writer: `examples/write_demo.rs`
+writes a file exercising every supported feature, and the script asserts
+its structure and contents through h5py (the reference library), then
+modifies a copy with h5py (adding/deleting links and attributes, crossing
+the compact/dense thresholds) and checks the result.
+
+```sh
+cargo run --example write_demo -- /tmp/demo.h5 v3     # or v2 / v0; add o4 / times
+/tmp/hdf5rs-venv/bin/python tools/check_written.py /tmp/demo.h5
+```
+
+The CI `interop` job runs it for superblock v0 (compatibility format), v2,
+v3 and 4-byte offsets.
+
 Clean-room reminder: only use h5py's public API to create and inspect files;
 never read libhdf5 or h5py source code.

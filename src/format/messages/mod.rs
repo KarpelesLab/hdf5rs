@@ -13,6 +13,7 @@ pub mod comment;
 pub mod continuation;
 pub mod dataspace;
 pub mod datatype;
+mod datatype_encode;
 pub mod driver_info;
 pub mod external_files;
 pub mod fill_value;

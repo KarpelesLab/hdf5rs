@@ -32,7 +32,7 @@
 use std::cmp::Ordering;
 use std::collections::HashSet;
 
-use super::{ByteReader, Sizes, UNDEFINED_ADDRESS};
+use super::{ByteReader, ByteWriter, Sizes, UNDEFINED_ADDRESS};
 use crate::checksum::metadata_checksum;
 use crate::error::{Error, Result};
 use crate::io::ReadAt;
@@ -825,6 +825,247 @@ impl BTreeV2 {
     }
 }
 
+impl Record {
+    /// The B-tree type this record belongs to.
+    pub fn tree_type(&self) -> u8 {
+        match self {
+            Record::HugeIndirect { .. } => 1,
+            Record::HugeIndirectFiltered { .. } => 2,
+            Record::HugeDirect { .. } => 3,
+            Record::HugeDirectFiltered { .. } => 4,
+            Record::LinkName { .. } => 5,
+            Record::LinkCreationOrder { .. } => 6,
+            Record::SharedMessageInHeap { .. } | Record::SharedMessageInObjectHeader { .. } => 7,
+            Record::AttributeName { .. } => 8,
+            Record::AttributeCreationOrder { .. } => 9,
+            Record::Chunk { .. } => 10,
+            Record::FilteredChunk { .. } => 11,
+        }
+    }
+
+    /// Append the record, zero-padded to `record_size` bytes.
+    ///
+    /// `chunk_size_len` is the width of the chunk size field of type 11
+    /// records (ignored otherwise).
+    pub fn encode(
+        &self,
+        w: &mut ByteWriter,
+        record_size: usize,
+        chunk_size_len: usize,
+    ) -> Result<()> {
+        let start = w.len();
+        match self {
+            Record::HugeIndirect {
+                address,
+                length,
+                id,
+            } => {
+                w.write_offset(*address)?;
+                w.write_length(*length)?;
+                w.write_length(*id)?;
+            }
+            Record::HugeIndirectFiltered {
+                address,
+                length,
+                filter_mask,
+                memory_size,
+                id,
+            } => {
+                w.write_offset(*address)?;
+                w.write_length(*length)?;
+                w.u32(*filter_mask);
+                w.write_length(*memory_size)?;
+                w.write_length(*id)?;
+            }
+            Record::HugeDirect { address, length } => {
+                w.write_offset(*address)?;
+                w.write_length(*length)?;
+            }
+            Record::HugeDirectFiltered {
+                address,
+                length,
+                filter_mask,
+                memory_size,
+            } => {
+                w.write_offset(*address)?;
+                w.write_length(*length)?;
+                w.u32(*filter_mask);
+                w.write_length(*memory_size)?;
+            }
+            Record::LinkName { hash, heap_id } => {
+                w.u32(*hash).bytes(heap_id);
+            }
+            Record::LinkCreationOrder {
+                creation_order,
+                heap_id,
+            } => {
+                w.u64(*creation_order).bytes(heap_id);
+            }
+            Record::SharedMessageInHeap {
+                hash,
+                reference_count,
+                heap_id,
+            } => {
+                w.u8(0).u32(*hash).u32(*reference_count).bytes(heap_id);
+            }
+            Record::SharedMessageInObjectHeader {
+                hash,
+                message_type,
+                object_header_index,
+                object_header_address,
+            } => {
+                w.u8(1)
+                    .u32(*hash)
+                    .u8(0)
+                    .u8(*message_type)
+                    .u16(*object_header_index);
+                w.write_offset(*object_header_address)?;
+            }
+            Record::AttributeName {
+                heap_id,
+                message_flags,
+                creation_order,
+                hash,
+            } => {
+                w.bytes(heap_id)
+                    .u8(*message_flags)
+                    .u32(*creation_order)
+                    .u32(*hash);
+            }
+            Record::AttributeCreationOrder {
+                heap_id,
+                message_flags,
+                creation_order,
+            } => {
+                w.bytes(heap_id).u8(*message_flags).u32(*creation_order);
+            }
+            Record::Chunk {
+                address,
+                scaled_offsets,
+            } => {
+                w.write_offset(*address)?;
+                for &o in scaled_offsets {
+                    w.u64(o);
+                }
+            }
+            Record::FilteredChunk {
+                address,
+                chunk_size,
+                filter_mask,
+                scaled_offsets,
+            } => {
+                w.write_offset(*address)?;
+                w.write_uint(*chunk_size, chunk_size_len)?;
+                w.u32(*filter_mask);
+                for &o in scaled_offsets {
+                    w.u64(o);
+                }
+            }
+        }
+        let used = w.len() - start;
+        if used > record_size {
+            return Err(Error::invalid(
+                "v2 B-tree record larger than the record size",
+            ));
+        }
+        w.zeros(record_size - used);
+        Ok(())
+    }
+}
+
+impl BTreeV2Header {
+    /// Encode the header (`BTHD` through checksum).
+    pub fn encode(&self, sizes: Sizes) -> Result<Vec<u8>> {
+        let mut w = ByteWriter::with_sizes(sizes);
+        w.bytes(b"BTHD")
+            .u8(0)
+            .u8(self.tree_type)
+            .u32(self.node_size)
+            .u16(self.record_size)
+            .u16(self.depth)
+            .u8(self.split_percent)
+            .u8(self.merge_percent);
+        w.write_offset(self.root_address)?;
+        w.u16(self.root_num_records);
+        w.write_length(self.total_records)?;
+        let sum = metadata_checksum(w.as_slice());
+        w.u32(sum);
+        Ok(w.into_vec())
+    }
+
+    /// Maximum number of records of a node at `depth` (0 = leaf) and the
+    /// widths of the (number of records, total records) child pointer
+    /// fields of such a node, for this header's node and record sizes.
+    pub fn node_capacity(&self, sizes: Sizes, depth: u16) -> Result<(u64, usize, usize)> {
+        let probe = BTreeV2Header { depth, ..*self };
+        let levels = compute_levels(&probe, sizes)?;
+        let l = levels
+            .get(usize::from(depth))
+            .ok_or_else(|| Error::invalid("v2 B-tree depth out of range"))?;
+        Ok((l.max_records, l.nrec_width, l.total_width))
+    }
+}
+
+/// A child pointer of an internal node being encoded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChildPointer {
+    /// Address of the child node.
+    pub address: u64,
+    /// Number of records in the child node.
+    pub num_records: u64,
+    /// Number of records in the child's subtree (only stored when the
+    /// node's total-records field width is non-zero).
+    pub total_records: u64,
+}
+
+/// Encode a v2 B-tree node of `header.node_size` bytes: a leaf (`BTLF`)
+/// when `children` is empty, otherwise an internal node (`BTIN`) at
+/// `depth` with `records.len() + 1` children.
+pub fn encode_node(
+    header: &BTreeV2Header,
+    sizes: Sizes,
+    depth: u16,
+    records: &[Record],
+    children: &[ChildPointer],
+    chunk_size_len: usize,
+) -> Result<Vec<u8>> {
+    let (max, nrec_width, total_width) = header.node_capacity(sizes, depth)?;
+    if records.len() as u64 > max {
+        return Err(Error::invalid("too many records for a v2 B-tree node"));
+    }
+    let leaf = depth == 0;
+    if leaf != children.is_empty() || (!leaf && children.len() != records.len() + 1) {
+        return Err(Error::invalid(
+            "v2 B-tree node children do not match its records",
+        ));
+    }
+    let mut w = ByteWriter::with_sizes(sizes);
+    w.bytes(if leaf { b"BTLF" } else { b"BTIN" })
+        .u8(0)
+        .u8(header.tree_type);
+    for r in records {
+        if r.tree_type() != header.tree_type {
+            return Err(Error::invalid("v2 B-tree record of the wrong type"));
+        }
+        r.encode(&mut w, usize::from(header.record_size), chunk_size_len)?;
+    }
+    for c in children {
+        w.write_offset(c.address)?;
+        w.write_uint(c.num_records, nrec_width)?;
+        if total_width > 0 {
+            w.write_uint(c.total_records, total_width)?;
+        }
+    }
+    let sum = metadata_checksum(w.as_slice());
+    w.u32(sum);
+    let size = header.node_size as usize;
+    if w.len() > size {
+        return Err(Error::invalid("v2 B-tree node overflows its node size"));
+    }
+    w.zeros(size - w.len());
+    Ok(w.into_vec())
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -1441,6 +1682,159 @@ pub(crate) mod tests {
             if let Ok(t) = BTreeV2::open(&data, hdr, Sizes::DEFAULT, RecordContext::default()) {
                 let _ = t.records(&data);
             }
+        }
+    }
+
+    #[test]
+    fn encode_round_trip() {
+        let sizes = Sizes::DEFAULT;
+        let rec = |i: u32| Record::LinkName {
+            hash: i * 10,
+            heap_id: vec![0, i as u8, 0, 0, 0, 1, 0],
+        };
+        let mut header = BTreeV2Header {
+            tree_type: 5,
+            node_size: 512,
+            record_size: 11,
+            depth: 0,
+            split_percent: 100,
+            merge_percent: 40,
+            root_address: 100,
+            root_num_records: 3,
+            total_records: 3,
+        };
+        let enc = header.encode(sizes).unwrap();
+        assert_eq!(enc.len(), BTreeV2Header::encoded_size(sizes));
+        assert_eq!(BTreeV2Header::parse(&enc, sizes).unwrap(), header);
+
+        // Depth 0: header at 0, leaf at 100.
+        let leaf = encode_node(&header, sizes, 0, &[rec(1), rec(2), rec(3)], &[], 0).unwrap();
+        assert_eq!(leaf.len(), 512);
+        let mut file = enc.clone();
+        file.resize(100, 0);
+        file.extend_from_slice(&leaf);
+        let tree = BTreeV2::open(&file, 0, sizes, RecordContext::default()).unwrap();
+        assert_eq!(tree.records(&file).unwrap(), vec![rec(1), rec(2), rec(3)]);
+
+        // Depth 1: leaves at 1000 and 2000, root at 3000.
+        header.depth = 1;
+        header.root_address = 3000;
+        header.root_num_records = 1;
+        header.total_records = 5;
+        let (max, _, total_width) = header.node_capacity(sizes, 1).unwrap();
+        assert!(max > 1);
+        assert_eq!(total_width, 0);
+        let mut file = header.encode(sizes).unwrap();
+        let l1 = encode_node(&header, sizes, 0, &[rec(1), rec(2)], &[], 0).unwrap();
+        let l2 = encode_node(&header, sizes, 0, &[rec(4), rec(5)], &[], 0).unwrap();
+        let kids = [
+            ChildPointer {
+                address: 1000,
+                num_records: 2,
+                total_records: 2,
+            },
+            ChildPointer {
+                address: 2000,
+                num_records: 2,
+                total_records: 2,
+            },
+        ];
+        let root = encode_node(&header, sizes, 1, &[rec(3)], &kids, 0).unwrap();
+        for (addr, node) in [(1000, &l1), (2000, &l2), (3000, &root)] {
+            file.resize(addr, 0);
+            file.extend_from_slice(node);
+        }
+        let tree = BTreeV2::open(&file, 0, sizes, RecordContext::default()).unwrap();
+        assert_eq!(
+            tree.records(&file).unwrap(),
+            (1..=5).map(rec).collect::<Vec<_>>()
+        );
+        assert!(encode_node(&header, sizes, 1, &[rec(3)], &kids[..1], 0).is_err());
+    }
+
+    #[test]
+    fn record_encode_round_trip() {
+        let sizes = Sizes::DEFAULT;
+        let ctx = RecordContext {
+            heap_id_len: None,
+            chunk_ndims: 2,
+            chunk_size_len: 3,
+        };
+        let records = [
+            Record::HugeIndirect {
+                address: 1,
+                length: 2,
+                id: 3,
+            },
+            Record::HugeIndirectFiltered {
+                address: 1,
+                length: 2,
+                filter_mask: 3,
+                memory_size: 4,
+                id: 5,
+            },
+            Record::HugeDirect {
+                address: 1,
+                length: 2,
+            },
+            Record::HugeDirectFiltered {
+                address: 1,
+                length: 2,
+                filter_mask: 3,
+                memory_size: 4,
+            },
+            Record::LinkName {
+                hash: 7,
+                heap_id: vec![1; 7],
+            },
+            Record::LinkCreationOrder {
+                creation_order: 9,
+                heap_id: vec![2; 7],
+            },
+            Record::SharedMessageInHeap {
+                hash: 1,
+                reference_count: 2,
+                heap_id: vec![3; 8],
+            },
+            Record::SharedMessageInObjectHeader {
+                hash: 1,
+                message_type: 3,
+                object_header_index: 2,
+                object_header_address: 99,
+            },
+            Record::AttributeName {
+                heap_id: vec![4; 8],
+                message_flags: 1,
+                creation_order: 2,
+                hash: 3,
+            },
+            Record::AttributeCreationOrder {
+                heap_id: vec![5; 8],
+                message_flags: 0,
+                creation_order: 6,
+            },
+            Record::Chunk {
+                address: 5,
+                scaled_offsets: vec![1, 2],
+            },
+            Record::FilteredChunk {
+                address: 5,
+                chunk_size: 70000,
+                filter_mask: 0,
+                scaled_offsets: vec![3, 4],
+            },
+        ];
+        for r in &records {
+            let size = Record::min_size(r.tree_type(), sizes, &ctx).unwrap();
+            let mut w = ByteWriter::with_sizes(sizes);
+            r.encode(&mut w, size + 2, ctx.chunk_size_len).unwrap();
+            assert_eq!(w.len(), size + 2);
+            assert_eq!(
+                &Record::parse(r.tree_type(), w.as_slice(), sizes, &ctx).unwrap(),
+                r
+            );
+            let mut w = ByteWriter::with_sizes(sizes);
+            assert!(r.encode(&mut w, size - 1, ctx.chunk_size_len).is_err());
         }
     }
 }

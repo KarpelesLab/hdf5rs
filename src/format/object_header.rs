@@ -6,7 +6,7 @@ use std::collections::{HashSet, VecDeque};
 use super::messages::MessageType;
 use super::messages::continuation::ContinuationMessage;
 use super::messages::ref_count::RefCountMessage;
-use super::{ByteReader, Sizes, UNDEFINED_ADDRESS};
+use super::{ByteReader, ByteWriter, Sizes, UNDEFINED_ADDRESS};
 use crate::checksum::metadata_checksum;
 use crate::error::{Error, Result};
 use crate::io::ReadAt;
@@ -198,6 +198,112 @@ impl ObjectHeader {
     /// Whether attribute creation order is indexed (version 2, flag bit 3).
     pub fn attribute_creation_order_indexed(&self) -> bool {
         self.version == 2 && self.flags & 0x08 != 0
+    }
+}
+
+/// Settings of a version 2 object header being encoded (see
+/// [`ObjectHeader::encode_v2`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct V2HeaderOptions {
+    /// Store object timestamps (flag bit 5).
+    pub times: Option<ObjectTimes>,
+    /// Store non-default attribute phase change values (flag bit 4).
+    pub attribute_phase_change: Option<AttributePhaseChange>,
+    /// Track attribute creation order (flag bit 2); every message then
+    /// carries a creation order field (`RawMessage::creation_order`,
+    /// defaulting to 0).
+    pub attribute_creation_order_tracked: bool,
+    /// Index attribute creation order (flag bit 3; requires tracking).
+    pub attribute_creation_order_indexed: bool,
+}
+
+impl ObjectHeader {
+    /// Encode a single-chunk version 2 object header (`OHDR`, prefix,
+    /// messages and checksum).
+    ///
+    /// Messages are written in order with their `msg_type`, `flags` and
+    /// `data`; continuation messages are not generated, so everything must
+    /// fit in chunk 0 (whose size field is sized automatically). A message
+    /// body longer than 65535 bytes is an error.
+    pub fn encode_v2(opts: &V2HeaderOptions, messages: &[RawMessage]) -> Result<Vec<u8>> {
+        let tracked = opts.attribute_creation_order_tracked;
+        if opts.attribute_creation_order_indexed && !tracked {
+            return Err(Error::invalid(
+                "attribute creation order indexed but not tracked",
+            ));
+        }
+        let mut body = ByteWriter::new();
+        for m in messages {
+            let ty = u8::try_from(m.msg_type)
+                .map_err(|_| Error::invalid("message type does not fit a version 2 header"))?;
+            let size = u16::try_from(m.data.len())
+                .map_err(|_| Error::LimitExceeded("header message larger than 65535 bytes"))?;
+            body.u8(ty).u16(size).u8(m.flags);
+            if tracked {
+                body.u16(m.creation_order.unwrap_or(0));
+            }
+            body.bytes(&m.data);
+        }
+        let body = body.into_vec();
+        let (size_bits, width) = match body.len() {
+            0..=0xff => (0u8, 1usize),
+            0x100..=0xffff => (1, 2),
+            0x1_0000..=0xffff_ffff => (2, 4),
+            _ => (3, 8),
+        };
+        let mut flags = size_bits;
+        if tracked {
+            flags |= V2_FLAG_CREATION_ORDER_TRACKED;
+        }
+        if opts.attribute_creation_order_indexed {
+            flags |= 0x08;
+        }
+        if opts.attribute_phase_change.is_some() {
+            flags |= V2_FLAG_PHASE_CHANGE;
+        }
+        if opts.times.is_some() {
+            flags |= V2_FLAG_TIMES;
+        }
+        let mut w = ByteWriter::new();
+        w.bytes(b"OHDR").u8(2).u8(flags);
+        if let Some(t) = opts.times {
+            w.u32(t.access)
+                .u32(t.modification)
+                .u32(t.change)
+                .u32(t.birth);
+        }
+        if let Some(p) = opts.attribute_phase_change {
+            w.u16(p.max_compact).u16(p.min_dense);
+        }
+        w.write_uint(body.len() as u64, width)?;
+        w.bytes(&body);
+        let sum = metadata_checksum(w.as_slice());
+        w.u32(sum);
+        Ok(w.into_vec())
+    }
+}
+
+impl ObjectHeader {
+    /// Encode a single-chunk version 1 object header: the 16-byte prefix
+    /// (with `ref_count`) followed by the messages, each padded to a
+    /// multiple of eight bytes.
+    pub fn encode_v1(ref_count: u32, messages: &[RawMessage]) -> Result<Vec<u8>> {
+        let mut body = ByteWriter::new();
+        for m in messages {
+            let padded = m.data.len().next_multiple_of(8);
+            let size = u16::try_from(padded)
+                .map_err(|_| Error::LimitExceeded("header message larger than 65535 bytes"))?;
+            body.u16(m.msg_type).u16(size).u8(m.flags).zeros(3);
+            body.bytes(&m.data).zeros(padded - m.data.len());
+        }
+        let count = u16::try_from(messages.len())
+            .map_err(|_| Error::LimitExceeded("too many header messages"))?;
+        let size = u32::try_from(body.len())
+            .map_err(|_| Error::LimitExceeded("object header larger than 4 GiB"))?;
+        let mut w = ByteWriter::new();
+        w.u8(1).u8(0).u16(count).u32(ref_count).u32(size).zeros(4);
+        w.bytes(body.as_slice());
+        Ok(w.into_vec())
     }
 }
 
@@ -677,6 +783,93 @@ mod tests {
         data.extend_from_slice(&block);
         let e = ObjectHeader::read(&data, 0, Sizes::DEFAULT).unwrap_err();
         assert!(matches!(e, Error::InvalidFormat(_)), "{e}");
+    }
+
+    #[test]
+    fn encode_v1_round_trip() {
+        let msgs = vec![
+            RawMessage {
+                msg_type: 0x11,
+                flags: 0,
+                creation_order: None,
+                data: vec![1; 16],
+            },
+            RawMessage {
+                msg_type: 0x0c,
+                flags: 1,
+                creation_order: None,
+                data: vec![2; 13],
+            },
+        ];
+        let mut data = vec![0u8; 8];
+        data.extend(ObjectHeader::encode_v1(3, &msgs).unwrap());
+        let h = ObjectHeader::read(&data, 8, Sizes::DEFAULT).unwrap();
+        assert_eq!(h.version, 1);
+        assert_eq!(h.ref_count, 3);
+        assert_eq!(h.declared_message_count, Some(2));
+        assert_eq!(h.messages[0], msgs[0]);
+        assert_eq!(h.messages[1].data[..13], msgs[1].data[..]);
+        assert_eq!(h.messages[1].data.len(), 16);
+    }
+
+    #[test]
+    fn encode_v2_round_trip() {
+        let msg = |ty: u16, flags: u8, order: Option<u16>, len: usize| RawMessage {
+            msg_type: ty,
+            flags,
+            creation_order: order,
+            data: (0..len).map(|i| i as u8).collect(),
+        };
+        let cases = [
+            (
+                V2HeaderOptions::default(),
+                vec![msg(1, 0, None, 8), msg(3, 1, None, 12)],
+            ),
+            (
+                V2HeaderOptions {
+                    times: Some(ObjectTimes {
+                        access: 1,
+                        modification: 2,
+                        change: 3,
+                        birth: 4,
+                    }),
+                    attribute_phase_change: Some(AttributePhaseChange {
+                        max_compact: 20,
+                        min_dense: 10,
+                    }),
+                    attribute_creation_order_tracked: true,
+                    attribute_creation_order_indexed: true,
+                },
+                vec![msg(12, 0, Some(0), 300), msg(12, 0, Some(1), 3)],
+            ),
+            (
+                V2HeaderOptions::default(),
+                vec![msg(12, 0, None, 65535), msg(1, 0, None, 4)],
+            ),
+        ];
+        for (opts, msgs) in cases {
+            let mut data = vec![0u8; 16];
+            data.extend(ObjectHeader::encode_v2(&opts, &msgs).unwrap());
+            let h = ObjectHeader::read(&data, 16, Sizes::DEFAULT).unwrap();
+            assert_eq!(h.version, 2);
+            assert_eq!(h.times, opts.times);
+            assert_eq!(h.attribute_phase_change, opts.attribute_phase_change);
+            assert_eq!(
+                h.attribute_creation_order_tracked(),
+                opts.attribute_creation_order_tracked
+            );
+            assert_eq!(h.messages, msgs);
+            assert_eq!(h.chunks.len(), 1);
+            assert_eq!(h.chunks[0].size, data.len() as u64 - 16);
+        }
+        assert!(
+            ObjectHeader::encode_v2(&V2HeaderOptions::default(), &[msg(1, 0, None, 65536)])
+                .is_err()
+        );
+        assert!(
+            ObjectHeader::encode_v2(&V2HeaderOptions::default(), &[msg(0x100, 0, None, 1)])
+                .is_err()
+        );
     }
 
     #[test]

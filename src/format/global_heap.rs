@@ -3,7 +3,7 @@
 //! Global heap collections store variable-length data and some reference
 //! targets; they are addressed through a [`GlobalHeapId`].
 
-use super::{ByteReader, Sizes, UNDEFINED_ADDRESS};
+use super::{ByteReader, ByteWriter, Sizes, UNDEFINED_ADDRESS};
 use crate::error::{Error, Result};
 use crate::io::ReadAt;
 
@@ -107,17 +107,11 @@ impl GlobalHeapCollection {
             .filter(|&e| e <= data.len() && e >= r.position())
             .ok_or_else(|| Error::invalid("global heap collection size out of range"))?;
         let mut r = ByteReader::with_sizes(&data[..end], sizes);
-        // The collection header and each object header are padded to a
-        // multiple of 8 bytes (only visible with 4-byte lengths, where they
-        // are 12 bytes long; verified on files written by the reference
-        // library).
-        let align8 = |n: usize| n.div_ceil(8) * 8;
-        r.seek(align8(8 + sizes.length as usize).min(end))?;
-        let obj_head = align8(8 + sizes.length as usize);
+        r.seek(Self::header_size(sizes) as usize)?;
+        let obj_head = Self::object_header_size(sizes) as usize;
         let mut objects = Vec::new();
         // A trailing free-space object whose header does not fit is implied.
         while r.remaining() >= obj_head {
-            let start = r.position();
             let index = r.read_u16()?;
             if index == 0 {
                 break;
@@ -126,7 +120,9 @@ impl GlobalHeapCollection {
             r.skip(4)?;
             let size = usize::try_from(r.read_length()?)
                 .map_err(|_| Error::invalid("global heap object too large"))?;
-            r.seek(start + obj_head)?;
+            // The object header is padded to a multiple of 8 bytes (only
+            // matters for lengths narrower than 8 bytes).
+            r.skip(obj_head - (8 + sizes.length as usize))?;
             let data = r.read_bytes(size)?.to_vec();
             // Data is padded to a multiple of 8; the padding of the last
             // object may be clipped by the collection end.
@@ -168,6 +164,79 @@ impl GlobalHeapCollection {
     }
 }
 
+/// Default (and minimum) size of a collection written by this crate, as
+/// recommended by the spec.
+pub const DEFAULT_COLLECTION_SIZE: u64 = 4096;
+
+impl GlobalHeapCollection {
+    /// Size of the collection header ("GCOL", version, reserved, size),
+    /// padded to a multiple of eight bytes as the reference library does
+    /// (observed with 4-byte lengths).
+    pub fn header_size(sizes: Sizes) -> u64 {
+        (8 + u64::from(sizes.length)).next_multiple_of(8)
+    }
+
+    /// Size of an object header (index, reference count, reserved, size),
+    /// padded to a multiple of eight bytes.
+    pub fn object_header_size(sizes: Sizes) -> u64 {
+        (8 + u64::from(sizes.length)).next_multiple_of(8)
+    }
+
+    /// Bytes taken by one object holding `data_len` bytes: its header plus
+    /// the data rounded up to a multiple of eight.
+    pub fn object_size(data_len: u64, sizes: Sizes) -> u64 {
+        Self::object_header_size(sizes) + data_len.next_multiple_of(8)
+    }
+
+    /// A collection of `collection_size` bytes holding `objects` (indices
+    /// must be distinct and non-zero).
+    pub fn from_objects(collection_size: u64, mut objects: Vec<GlobalHeapObject>) -> Self {
+        objects.sort_by_key(|o| o.index);
+        GlobalHeapCollection {
+            collection_size,
+            objects,
+        }
+    }
+
+    /// Encode the collection: header, objects in index order, then a
+    /// free-space object (index 0) covering the remaining bytes, whose
+    /// size field includes its own header. Objects are written with the
+    /// reference count they carry.
+    pub fn encode(&self, sizes: Sizes) -> Result<Vec<u8>> {
+        let mut w = ByteWriter::with_sizes(sizes);
+        w.bytes(&GLOBAL_HEAP_SIGNATURE).u8(1).zeros(3);
+        w.write_length(self.collection_size)?;
+        w.align(8);
+        let mut last = 0u16;
+        for o in &self.objects {
+            if o.index == 0 || o.index <= last {
+                return Err(Error::invalid(
+                    "global heap object indices must be distinct and non-zero",
+                ));
+            }
+            last = o.index;
+            w.u16(o.index).u16(o.reference_count).zeros(4);
+            w.write_length(o.data.len() as u64)?;
+            w.align(8);
+            w.bytes(&o.data);
+            w.zeros(o.data.len().next_multiple_of(8) - o.data.len());
+        }
+        let total = usize::try_from(self.collection_size)
+            .map_err(|_| Error::LimitExceeded("global heap collection size"))?;
+        let rest = total
+            .checked_sub(w.len())
+            .ok_or_else(|| Error::invalid("global heap objects exceed the collection size"))?;
+        let obj_head = Self::object_header_size(sizes) as usize;
+        if rest >= obj_head {
+            w.u16(0).u16(0).zeros(4);
+            w.write_length(rest as u64)?;
+            w.align(8);
+        }
+        w.zeros(total - w.len());
+        Ok(w.into_vec())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -178,8 +247,9 @@ mod tests {
         v.extend(1u16.to_le_bytes());
         v.extend([0; 4]);
         v.extend(FileBuilder::uint(data.len() as u64, sizes.length));
-        // The header and the data are padded to a multiple of 8.
-        v.resize(v.len().div_ceil(8) * 8, 0);
+        v.resize(v.len().next_multiple_of(8), 0);
+        // Only the data is padded to a multiple of 8 ("storage space
+        // allocated for the object data is rounded up").
         let mut d = data.to_vec();
         d.resize(d.len().div_ceil(8) * 8, 0);
         v.extend(d);
@@ -190,7 +260,7 @@ mod tests {
         let mut v = b"GCOL".to_vec();
         v.extend([1, 0, 0, 0]);
         v.extend(FileBuilder::uint(size, sizes.length));
-        v.resize(v.len().div_ceil(8) * 8, 0);
+        v.resize(v.len().next_multiple_of(8), 0);
         for (i, d) in objs {
             v.extend(object(sizes, *i, d));
         }
@@ -304,5 +374,63 @@ mod tests {
                 let _ = g.get(1);
             }
         }
+    }
+
+    #[test]
+    fn encode_round_trip() {
+        for sizes in [
+            Sizes::DEFAULT,
+            Sizes {
+                offset: 4,
+                length: 4,
+            },
+        ] {
+            let objs = vec![
+                GlobalHeapObject {
+                    index: 2,
+                    reference_count: 0,
+                    data: b"world!!!!".to_vec(),
+                },
+                GlobalHeapObject {
+                    index: 1,
+                    reference_count: 1,
+                    data: b"hello".to_vec(),
+                },
+            ];
+            let c = GlobalHeapCollection::from_objects(DEFAULT_COLLECTION_SIZE, objs);
+            let enc = c.encode(sizes).unwrap();
+            assert_eq!(enc.len() as u64, DEFAULT_COLLECTION_SIZE);
+            let back = GlobalHeapCollection::parse(&enc, sizes).unwrap();
+            assert_eq!(back, c);
+            // Free-space object right after the two objects.
+            let used = GlobalHeapCollection::header_size(sizes)
+                + GlobalHeapCollection::object_size(5, sizes)
+                + GlobalHeapCollection::object_size(9, sizes);
+            let at = used as usize;
+            assert_eq!(&enc[at..at + 2], &[0, 0]);
+            let mut r = ByteReader::with_sizes(&enc[at + 8..], sizes);
+            assert_eq!(r.read_length().unwrap(), DEFAULT_COLLECTION_SIZE - used);
+            // Exactly full: no free-space object.
+            let exact = GlobalHeapCollection::from_objects(used, back.objects().to_vec());
+            assert_eq!(exact.encode(sizes).unwrap().len() as u64, used);
+            let small = GlobalHeapCollection::from_objects(used - 1, back.objects().to_vec());
+            assert!(small.encode(sizes).is_err());
+        }
+        let dup = GlobalHeapCollection::from_objects(
+            4096,
+            vec![
+                GlobalHeapObject {
+                    index: 1,
+                    reference_count: 0,
+                    data: vec![],
+                },
+                GlobalHeapObject {
+                    index: 1,
+                    reference_count: 0,
+                    data: vec![],
+                },
+            ],
+        );
+        assert!(dup.encode(Sizes::DEFAULT).is_err());
     }
 }

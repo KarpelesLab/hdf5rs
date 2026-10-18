@@ -5,7 +5,7 @@
 //! message lives.
 
 use crate::error::{Error, Result};
-use crate::format::{ByteReader, Sizes};
+use crate::format::{ByteReader, ByteWriter, Sizes};
 
 /// Where the actual message body is stored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,6 +70,55 @@ impl SharedMessage {
     }
 }
 
+impl SharedMessage {
+    /// A version 3 record pointing at a committed message in the object
+    /// header at `address` (e.g. a named datatype).
+    pub fn committed(address: u64) -> Self {
+        SharedMessage {
+            version: 3,
+            location: SharedLocation::ObjectHeader(address),
+        }
+    }
+
+    /// Encode the record.
+    pub fn encode(&self, sizes: Sizes) -> Result<Vec<u8>> {
+        let mut w = ByteWriter::with_sizes(sizes);
+        match (self.version, self.location) {
+            (1 | 2, SharedLocation::ObjectHeader(a)) => {
+                w.u8(self.version).u8(2);
+                if self.version == 1 {
+                    w.zeros(6);
+                }
+                w.write_offset(a)?;
+            }
+            (3, loc) => {
+                w.u8(3);
+                match loc {
+                    SharedLocation::NotShared => {
+                        w.u8(0);
+                    }
+                    SharedLocation::SharedHeap(id) => {
+                        w.u8(1).bytes(&id);
+                    }
+                    SharedLocation::ObjectHeader(a) => {
+                        w.u8(2);
+                        w.write_offset(a)?;
+                    }
+                    SharedLocation::Shareable => {
+                        w.u8(3);
+                    }
+                }
+            }
+            (v, _) => {
+                return Err(Error::invalid(format!(
+                    "shared message version {v} cannot encode this location"
+                )));
+            }
+        }
+        Ok(w.into_vec())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -115,5 +164,41 @@ mod tests {
             SharedLocation::ObjectHeader(9)
         );
         assert!(SharedMessage::parse(&[1, 0, 0, 0, 0, 0, 0], Sizes::DEFAULT).is_err());
+    }
+
+    #[test]
+    fn encode_round_trip() {
+        let cases = [
+            SharedMessage::committed(4096),
+            SharedMessage {
+                version: 3,
+                location: SharedLocation::SharedHeap([1; 8]),
+            },
+            SharedMessage {
+                version: 3,
+                location: SharedLocation::NotShared,
+            },
+            SharedMessage {
+                version: 3,
+                location: SharedLocation::Shareable,
+            },
+            SharedMessage {
+                version: 2,
+                location: SharedLocation::ObjectHeader(8),
+            },
+            SharedMessage {
+                version: 1,
+                location: SharedLocation::ObjectHeader(8),
+            },
+        ];
+        for m in &cases {
+            let enc = m.encode(Sizes::DEFAULT).unwrap();
+            assert_eq!(&SharedMessage::parse(&enc, Sizes::DEFAULT).unwrap(), m);
+        }
+        let bad = SharedMessage {
+            version: 1,
+            location: SharedLocation::Shareable,
+        };
+        assert!(bad.encode(Sizes::DEFAULT).is_err());
     }
 }

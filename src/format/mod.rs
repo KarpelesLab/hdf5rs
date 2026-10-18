@@ -1,4 +1,4 @@
-//! Low-level decoding of on-disk HDF5 structures.
+//! Low-level decoding and encoding of on-disk HDF5 structures.
 //!
 //! Everything in this module mirrors the HDF5 File Format Specification
 //! closely; the friendly public API is built on top of it.
@@ -22,9 +22,11 @@ pub mod symbol_table_node;
 #[cfg(test)]
 pub(crate) mod test_util;
 pub mod vds;
+mod writer;
 
 pub use reader::ByteReader;
 pub use symbol_table_entry::{ScratchPad, SymbolTableEntry};
+pub use writer::ByteWriter;
 
 /// The "undefined address" value, after widening to 64 bits.
 ///

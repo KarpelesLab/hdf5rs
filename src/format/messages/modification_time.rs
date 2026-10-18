@@ -2,7 +2,7 @@
 //! spec IV.A.2.s) and the deprecated ASCII form (type 0x000E, IV.A.2.o).
 
 use crate::error::{Error, Result};
-use crate::format::{ByteReader, Sizes};
+use crate::format::{ByteReader, ByteWriter, Sizes};
 
 /// Object modification time as seconds since the UNIX epoch (type 0x0012).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,6 +104,15 @@ fn days_from_civil(y: i64, m: u8, d: u8) -> i64 {
     era * 146_097 + doe - 719_468
 }
 
+impl ModificationTimeMessage {
+    /// Encode the message body (version 1).
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut w = ByteWriter::new();
+        w.u8(1).zeros(3).u32(self.seconds);
+        Ok(w.into_vec())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -130,5 +139,16 @@ mod tests {
         assert!(ModificationTimeOldMessage::parse(b"2001020304050", Sizes::DEFAULT).is_err());
         assert!(ModificationTimeOldMessage::parse(b"2001130304050600", Sizes::DEFAULT).is_err());
         assert!(ModificationTimeOldMessage::parse(b"20x1020304050600", Sizes::DEFAULT).is_err());
+    }
+
+    #[test]
+    fn encode_round_trip() {
+        let m = ModificationTimeMessage {
+            seconds: 1_700_000_000,
+        };
+        assert_eq!(
+            ModificationTimeMessage::parse(&m.encode().unwrap(), Sizes::DEFAULT).unwrap(),
+            m
+        );
     }
 }
