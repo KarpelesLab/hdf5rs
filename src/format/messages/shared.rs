@@ -43,7 +43,10 @@ impl SharedMessage {
                     // Reserved: 2 bytes + 4 bytes.
                     r.skip(6)?;
                 }
-                if kind != 0 {
+                // The spec only lists type 0, but libhdf5 writes 2 ("in an
+                // object header", as in version 3) for committed datatypes
+                // (observed in h5py-generated files).
+                if kind != 0 && kind != 2 {
                     return Err(Error::invalid(format!(
                         "shared message v{version} with unknown type {kind}"
                     )));
