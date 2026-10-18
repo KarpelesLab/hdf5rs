@@ -103,16 +103,17 @@ Goal: read the vast majority of real-world files, including compressed ones.
   - [x] single chunk, implicit, fixed array (`FAHD`/`FADB`), extensible array
         (`EAHD`/`EAIB`/`EASB`/`EADB`), v2 B-tree — layout v4
 - [x] Filter pipeline message (versions 1 and 2), per-chunk filter masks
-- [ ] Filters implemented in-crate:
+- [x] Filters implemented in-crate:
   - [x] deflate (zlib) — via `compcol`
   - [x] shuffle
   - [x] Fletcher-32 (verified against fixtures)
-  - [ ] N-bit and scale-offset
+  - [x] N-bit and scale-offset
   - [x] LZF (common in h5py output; verified against fixtures)
 - [x] Pluggable filters: a `Filter` trait plus registry so users can add
       codecs without the core depending on them
-- [ ] Optional `compcol`-backed features for Zstd, LZ4, bzip2 (and Blosc
-      framing on top of them)
+- [x] Optional `compcol`-backed features: `zstd`, `lz4`, `bzip2`, `blosc`,
+      `bitshuffle` (`all-filters`); blosclz unsupported; high-level zstd
+      decoding pending a compcol fix
 - [ ] Chunk cache with configurable size
 - [x] Virtual dataset layout (layout v4, class 3) — read, same-file and
       external sources
