@@ -11,7 +11,9 @@ Default branch: `master`. See ROADMAP.md for milestones.
   black-box observation of files. Never read, copy or translate source code
   of libhdf5, h5py internals, or other HDF5/codec implementations
   (jhdf, hdf5-rust, pyfive, zlib, miniz, …).
-- **No dependencies** in `[dependencies]` without explicit approval.
+- **No dependencies** in `[dependencies]` without explicit approval. The one
+  approved dependency is `compcol` (our own pure-Rust compression crate,
+  used for zlib/deflate and other codecs), always optional behind a feature.
 - `#![forbid(unsafe_code)]`. No panics on malformed input: no `unwrap`,
   unchecked indexing or unchecked arithmetic on file-derived values outside
   tests. Cap allocations derived from file data (validate against file size

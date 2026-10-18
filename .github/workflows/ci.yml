@@ -24,6 +24,7 @@ jobs:
           toolchain: ${{ matrix.toolchain }}
       - run: cargo build --all-targets
       - run: cargo test
+      - run: cargo test --no-default-features
 
   lint:
     runs-on: ubuntu-latest

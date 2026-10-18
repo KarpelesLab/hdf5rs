@@ -12,8 +12,11 @@ categories = ["encoding", "parser-implementations", "science"]
 exclude = ["/.github"]
 
 [dependencies]
+compcol = { version = "0.7.2", default-features = false, features = ["alloc", "zlib"], optional = true }
 
 [dev-dependencies]
 
 [features]
-default = []
+default = ["deflate"]
+# The deflate (gzip) filter, via the `compcol` crate.
+deflate = ["dep:compcol"]

@@ -14,13 +14,14 @@
 //! - a [`FilterRegistry`] mapping filter ids to implementations,
 //! - [`decode_pipeline`] / [`encode_pipeline`] which run a pipeline
 //!   description ([`PipelineStep`]s) over one chunk,
-//! - built-in codecs: [`deflate`], [`shuffle`], [`fletcher32`], [`lzf`].
+//! - built-in codecs: `deflate` (feature `deflate`), [`shuffle`], [`fletcher32`], [`lzf`].
 
 use std::collections::BTreeMap;
 use std::fmt;
 
 use crate::{Error, Result};
 
+#[cfg(feature = "deflate")]
 pub mod deflate;
 pub mod fletcher32;
 pub mod lzf;
@@ -168,15 +169,18 @@ pub trait Filter: Send + Sync {
     fn encode(&self, client_data: &[u32], input: Vec<u8>, ctx: &FilterContext) -> Result<Vec<u8>>;
 }
 
-/// The deflate (gzip/zlib) filter, id [`DEFLATE`].
+/// The deflate (gzip/zlib) filter, id [`DEFLATE`] (requires the `deflate`
+/// feature).
 ///
 /// Client data: `[level]` (0–9, default 6) for encoding; ignored when
 /// decoding. Chunks hold a zlib stream (RFC 1950). The codec itself lives in
 /// [`deflate`]; this adapter is kept here so the codec module only needs to
-/// provide [`deflate::zlib_decompress`] and [`deflate::zlib_compress`].
+/// provide `zlib_decompress` and `zlib_compress`.
+#[cfg(feature = "deflate")]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Deflate;
 
+#[cfg(feature = "deflate")]
 impl Filter for Deflate {
     fn id(&self) -> u16 {
         DEFLATE
@@ -192,7 +196,7 @@ impl Filter for Deflate {
 
     fn encode(&self, client_data: &[u32], input: Vec<u8>, _ctx: &FilterContext) -> Result<Vec<u8>> {
         let level = client_data.first().copied().unwrap_or(6).min(9);
-        Ok(deflate::zlib_compress(&input, level))
+        deflate::zlib_compress(&input, level)
     }
 }
 
@@ -212,6 +216,7 @@ impl FilterRegistry {
     /// and lzf.
     pub fn with_builtin() -> Self {
         let mut r = FilterRegistry::new();
+        #[cfg(feature = "deflate")]
         r.register(Box::new(Deflate));
         r.register(Box::new(shuffle::Shuffle));
         r.register(Box::new(fletcher32::Fletcher32));
@@ -409,10 +414,11 @@ mod tests {
     #[test]
     fn registry_basics() {
         let r = FilterRegistry::with_builtin();
-        assert_eq!(
-            r.ids().collect::<Vec<_>>(),
-            [DEFLATE, SHUFFLE, FLETCHER32, LZF]
-        );
+        let mut expected = vec![SHUFFLE, FLETCHER32, LZF];
+        if cfg!(feature = "deflate") {
+            expected.insert(0, DEFLATE);
+        }
+        assert_eq!(r.ids().collect::<Vec<_>>(), expected);
         assert_eq!(r.get(SHUFFLE).unwrap().name(), "shuffle");
         assert!(r.get(SZIP).is_none());
         assert!(FilterRegistry::new().get(DEFLATE).is_none());

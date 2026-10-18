@@ -10,10 +10,10 @@ clean-room policy in the README).
 
 ## Guiding principles
 
-- **Zero required dependencies.** Everything in the default build is
-  implemented in this crate. Optional features may pull in small,
-  well-maintained pure-Rust crates, but every codec we can reasonably write
-  ourselves (deflate, shuffle, Fletcher-32, LZF) we write ourselves.
+- **Minimal dependencies.** The only dependency is our own pure-Rust
+  [`compcol`](https://crates.io/crates/compcol) compression crate, optional
+  behind per-codec features (`deflate` on by default). Format-specific
+  filters (shuffle, Fletcher-32, LZF, N-bit, scale-offset) live in-crate.
 - **No `unsafe`.** Enforced with `#![forbid(unsafe_code)]`.
 - **Never panic on bad input.** Every parser returns `Result`; malformed or
   hostile files must produce errors, not panics, infinite loops, or unbounded
@@ -101,14 +101,15 @@ Goal: read the vast majority of real-world files, including compressed ones.
         (`EAHD`/`EAIB`/`EASB`/`EADB`), v2 B-tree — layout v4
 - [ ] Filter pipeline message (versions 1 and 2), per-chunk filter masks
 - [ ] Filters implemented in-crate:
-  - [ ] deflate (zlib) — own inflate implementation
-  - [ ] shuffle
-  - [ ] Fletcher-32
+  - [x] deflate (zlib) — via `compcol`
+  - [x] shuffle
+  - [x] Fletcher-32 (to be verified against fixtures)
   - [ ] N-bit and scale-offset
-  - [ ] LZF (common in h5py output)
-- [ ] Optional / pluggable filters: a `Filter` trait plus registry so users
-      can add codecs (e.g. szip/AEC, Blosc, Zstd, LZ4, bzip2) without the
-      core depending on them; optional features for well-known pure-Rust ones
+  - [x] LZF (common in h5py output; to be verified against fixtures)
+- [x] Pluggable filters: a `Filter` trait plus registry so users can add
+      codecs without the core depending on them
+- [ ] Optional `compcol`-backed features for Zstd, LZ4, bzip2 (and Blosc
+      framing on top of them)
 - [ ] Chunk cache with configurable size
 - [ ] Virtual dataset layout (layout v4, class 3) — read, same-file and
       external sources
@@ -137,7 +138,7 @@ Goal: create new files that the reference tools read without complaint.
 - [ ] Chunked datasets with fixed-array, extensible-array, v2 B-tree and
       single-chunk indexes (and v1 B-tree in compat mode)
 - [ ] Resizable datasets (unlimited dimensions), append workflows
-- [ ] Filters on write: deflate (own encoder), shuffle, Fletcher-32, LZF
+- [ ] Filters on write: deflate, shuffle, Fletcher-32, LZF
 - [ ] Open existing files read-write: add/delete objects and attributes,
       overwrite data in place, extend datasets
 - [ ] Partial (hyperslab) writes
