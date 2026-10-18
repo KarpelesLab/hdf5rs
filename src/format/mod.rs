@@ -4,6 +4,9 @@
 //! closely; the friendly public API is built on top of it.
 
 pub mod btree_v1;
+pub mod chunk_index;
+pub mod extensible_array;
+pub mod fixed_array;
 pub mod global_heap;
 pub mod group_v1;
 pub mod local_heap;
