@@ -122,20 +122,20 @@ Goal: read the vast majority of real-world files, including compressed ones.
 
 Goal: create new files that the reference tools read without complaint.
 
-- [ ] File creation; superblock v2/v3 (latest format) and v0 (compat) modes
-- [ ] Object header v2 writing (with v1 for compat mode)
-- [ ] Free-space management for the writer (simple append allocator first,
+- [x] File creation; superblock v2/v3 (latest format) and v0 (compat) modes
+- [x] Object header v2 writing (with v1 for compat mode)
+- [~] Free-space management for the writer (simple append allocator done;
       then reuse of freed space)
-- [ ] Groups: compact link storage, then dense storage (fractal heap +
+- [x] Groups: compact link storage, then dense storage (fractal heap +
       v2 B-tree writing) for large groups; old-style symbol-table groups in
       compat mode
-- [ ] Datasets: contiguous and compact layouts, all fixed-size datatypes,
+- [x] Datasets: contiguous and compact layouts, all fixed-size datatypes,
       fill values
-- [ ] Attributes: compact and dense storage
-- [ ] Variable-length strings and sequences (global heap writing)
-- [ ] Committed (named) datatypes, hard and soft links
-- [ ] Correct metadata checksums everywhere
-- [ ] CI step: round-trip every written fixture through `h5dump` / h5py
+- [x] Attributes: compact and dense storage
+- [x] Variable-length strings and sequences (global heap writing)
+- [x] Committed (named) datatypes, hard and soft links
+- [x] Correct metadata checksums everywhere
+- [x] CI step: round-trip every written fixture through `h5dump` / h5py
 
 ## Milestone 5 — Write: chunking, compression, modification (`0.5`)
 
