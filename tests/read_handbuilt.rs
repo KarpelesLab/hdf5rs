@@ -437,6 +437,9 @@ fn external_raw_data_files() {
     std::fs::write(dir.join("raw.bin"), &raw).unwrap();
     std::fs::write(dir.join("plain.h5"), external_data_file("raw.bin")).unwrap();
     std::fs::write(sub.join("up.h5"), external_data_file("../raw.bin")).unwrap();
+    let abs = dir.join("raw.bin");
+    let abs = abs.to_str().unwrap();
+    std::fs::write(dir.join("abs.h5"), external_data_file(abs)).unwrap();
 
     let f = File::open(dir.join("plain.h5")).unwrap();
     let d = f.dataset("ext").unwrap();
@@ -479,20 +482,35 @@ fn external_raw_data_files() {
         locked.dataset("ext").unwrap().read::<i32>(),
         Err(Error::Unsupported(_))
     ));
-    // `..` components: honoured by default, rejected when confined.
+    // `..` components: rejected by default, honoured when not confined.
     let up = File::open(sub.join("up.h5")).unwrap();
-    assert_eq!(
-        up.dataset("ext").unwrap().read::<i32>().unwrap(),
-        [7, -8, 9]
-    );
-    let confined = File::open_with(
-        sub.join("up.h5"),
-        hdf5rs::FileAccess::default().confine_to_directory(true),
-    )
-    .unwrap();
     assert!(matches!(
-        confined.dataset("ext").unwrap().read::<i32>(),
+        up.dataset("ext").unwrap().read::<i32>(),
         Err(Error::InvalidFormat(_))
     ));
+    let unconfined = File::open_with(
+        sub.join("up.h5"),
+        hdf5rs::FileAccess::default().confine_to_directory(false),
+    )
+    .unwrap();
+    assert_eq!(
+        unconfined.dataset("ext").unwrap().read::<i32>().unwrap(),
+        [7, -8, 9]
+    );
+    // Absolute names: likewise.
+    let abs = File::open(dir.join("abs.h5")).unwrap();
+    assert!(matches!(
+        abs.dataset("ext").unwrap().read::<i32>(),
+        Err(Error::InvalidFormat(_))
+    ));
+    let unconfined = File::open_with(
+        dir.join("abs.h5"),
+        hdf5rs::FileAccess::default().confine_to_directory(false),
+    )
+    .unwrap();
+    assert_eq!(
+        unconfined.dataset("ext").unwrap().read::<i32>().unwrap(),
+        [7, -8, 9]
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -44,14 +44,14 @@ const MAX_SHARED_DEPTH: u32 = 8;
 ///
 /// # Security
 ///
-/// The file names come from the HDF5 file. Absolute names and names with
-/// `..` components are honoured by default (as the reference library
-/// does), so an untrusted file can make the reader open, and return the
-/// contents of, any file readable by the process. When reading untrusted
-/// files, either disable access to other files entirely
-/// (`external_files(false)`) or confine names to the file's directory and
-/// its subdirectories (`confine_to_directory(true)`, which rejects absolute
-/// names and `..` components; symbolic links are still followed).
+/// The file names come from the HDF5 file. By default they are confined to
+/// the file's directory and its subdirectories: absolute names and names
+/// with `..` components are rejected, so a hostile file cannot make the
+/// reader return the contents of arbitrary files (symbolic links inside
+/// the directory are still followed). Files that legitimately point
+/// elsewhere, as the reference library allows, need
+/// `confine_to_directory(false)`; only use it for trusted files. To forbid
+/// opening other files at all, use `external_files(false)`.
 ///
 /// # Resource limits
 ///
@@ -77,7 +77,7 @@ const MAX_SHARED_DEPTH: u32 = 8;
 pub struct FileAccess {
     /// Allow opening other files at all (default `true`).
     pub external_files: bool,
-    /// Reject absolute names and `..` components (default `false`).
+    /// Reject absolute names and `..` components (default `true`).
     pub confine_to_directory: bool,
     /// Follow external links during path resolution (default `false`).
     pub follow_external_links: bool,
@@ -92,7 +92,7 @@ impl Default for FileAccess {
     fn default() -> Self {
         FileAccess {
             external_files: true,
-            confine_to_directory: false,
+            confine_to_directory: true,
             follow_external_links: false,
             limits: ReadLimits::default(),
             chunk_cache_bytes: DEFAULT_CHUNK_CACHE_BYTES,
@@ -107,7 +107,8 @@ impl FileAccess {
         self
     }
 
-    /// Confine other files to the HDF5 file's directory tree.
+    /// Confine other files to the HDF5 file's directory tree (the
+    /// default); `false` also honours absolute names and `..` components.
     pub fn confine_to_directory(mut self, confine: bool) -> Self {
         self.confine_to_directory = confine;
         self
