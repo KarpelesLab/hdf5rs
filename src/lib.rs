@@ -13,6 +13,14 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod checksum;
+mod error;
+pub mod format;
+pub mod io;
+
+pub use error::{Error, Result};
+pub use io::ReadAt;
+
 /// The 8-byte signature that marks the start of an HDF5 superblock.
 ///
 /// The superblock is located at file offset 0, or at 512, 1024, 2048, …

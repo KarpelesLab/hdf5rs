@@ -32,12 +32,12 @@ clean-room policy in the README).
 ## Milestone 0 — Foundations (`0.0.x`)
 
 - [x] Crate scaffold, CI (stable + MSRV, fmt, clippy, docs), license
-- [ ] Error type (`Error`, `Result`), no panics on malformed input
-- [ ] Storage abstraction: positional read/write trait, `File` and in-memory
-      (`Vec<u8>` / `&[u8]`) implementations
-- [ ] Little-endian byte cursor with variable-width *offset* and *length*
+- [x] Error type (`Error`, `Result`), no panics on malformed input
+- [x] Storage abstraction: positional read trait, `File` and in-memory
+      (`Vec<u8>` / `&[u8]`) implementations (write side: Milestone 4)
+- [x] Little-endian byte cursor with variable-width *offset* and *length*
       fields (sizes from the superblock), "undefined address" handling
-- [ ] Jenkins `lookup3` checksum (§ checksum used by v2 structures)
+- [x] Jenkins `lookup3` checksum (§ checksum used by v2 structures)
 - [ ] Test fixture corpus: script (outside the crate build) that generates a
       set of `.h5` files with h5py, plus checked-in small fixtures
 - [ ] Basic fuzz harness (`cargo fuzz`, kept out of the published crate)
