@@ -158,7 +158,9 @@ impl DataLayout {
         let mut r = ByteReader::with_sizes(data, sizes);
         match r.read_u8()? {
             v @ (1 | 2) => parse_v1_v2(&mut r, v),
-            v @ (3 | 4) => parse_v3_v4(&mut r, v),
+            // Version 5 (written by HDF5 2.0 for filtered chunked datasets) has
+            // the same encoding as version 4.
+            v @ (3..=5) => parse_v3_v4(&mut r, v),
             v => Err(Error::unsupported(format!("data layout version {v}"))),
         }
     }
@@ -234,7 +236,7 @@ fn parse_v3_v4(r: &mut ByteReader<'_>, version: u8) -> Result<DataLayout> {
             }))
         }
         2 => parse_v4_chunked(r).map(DataLayout::Chunked),
-        3 if version == 4 => Ok(DataLayout::Virtual {
+        3 if version >= 4 => Ok(DataLayout::Virtual {
             heap_address: r.read_offset()?,
             heap_index: r.read_u32()?,
         }),
@@ -477,6 +479,32 @@ mod tests {
         );
         assert_eq!(c.index.address(), 0x2000);
         assert!(DataLayout::parse(&v4_chunked(0, 6, &[]), S).is_err());
+    }
+
+    #[test]
+    fn v5_matches_v4() {
+        // HDF5 2.0 writes version 5 for filtered chunked datasets (seen in
+        // the h5py fixtures: filtered single chunk below), encoded exactly
+        // like version 4.
+        let v = [
+            5, 2, 2, 3, 1, 4, 5, 4, 1, 0x2d, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xe0, 9, 0, 0, 0, 0,
+            0, 0,
+        ];
+        let DataLayout::Chunked(c) = DataLayout::parse(&v, S).unwrap() else {
+            panic!()
+        };
+        assert_eq!((c.dims, c.element_size), (vec![4, 5], 4));
+        assert_eq!(
+            c.index,
+            ChunkIndex::SingleChunk {
+                address: 0x9e0,
+                filtered: Some(FilteredChunk {
+                    size: 0x2d,
+                    filter_mask: 0
+                })
+            }
+        );
+        assert!(DataLayout::parse(&[6, 1], S).is_err());
     }
 
     #[test]

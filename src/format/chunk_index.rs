@@ -362,8 +362,10 @@ pub fn unlinearize(mut index: u64, nchunks: &[u64]) -> Result<Vec<u64>> {
 /// When the unlimited dimension is already dimension 0 this is exactly
 /// [`linear_index`].
 ///
-/// This is an inference from the structure's design; verify against real
-/// files.
+/// This was inferred from the structure's design and has been confirmed
+/// against files written by the reference library, with the unlimited
+/// dimension first, in the middle and last, and with fixed dimensions
+/// whose maximum exceeds their current size.
 pub fn extensible_linear_index(
     scaled: &[u64],
     nchunks: &[u64],

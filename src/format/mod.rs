@@ -19,7 +19,7 @@ pub mod superblock;
 mod symbol_table_entry;
 pub mod symbol_table_node;
 #[cfg(test)]
-mod test_util;
+pub(crate) mod test_util;
 
 pub use reader::ByteReader;
 pub use symbol_table_entry::{ScratchPad, SymbolTableEntry};

@@ -18,6 +18,7 @@ mod error;
 pub mod filters;
 pub mod format;
 pub mod io;
+pub mod read;
 pub mod types;
 
 pub use error::{Error, Result};
