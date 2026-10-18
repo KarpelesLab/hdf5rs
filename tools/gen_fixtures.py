@@ -249,7 +249,7 @@ def fill_dtypes(f, latest):
     write_raw(d, np.arange(12, dtype="<i4").reshape(2, 2, 3), at)
     at2 = h5py.h5t.array_create(h5py.h5t.IEEE_F64BE, (4,))
     d = low_level_dataset(f, "array/f64be_4", at2, (3,))
-    write_raw(d, np.arange(12, dtype=">f8").reshape(3, 4) / 4, at2)
+    write_raw(d, (np.arange(12).reshape(3, 4) / 4).astype(">f8"), at2)
 
     f.create_dataset("opaque/v8", data=np.frombuffer(bytes(range(24)), dtype="V8"))
     ot = h5py.h5t.create(h5py.h5t.OPAQUE, 4)

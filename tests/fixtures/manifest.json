@@ -1657,7 +1657,7 @@
    "description": "Every datatype class, earliest format",
    "libver": "earliest",
    "size": 38392,
-   "sha256": "ea867cf028f20bd2e37d17ccbccca16a0a3f18ac09330f96d6b569156c11ff94",
+   "sha256": "e368e1176f04d3a3e70af9a25860b99269a97bdb92933feb1bdda5624caf5757",
    "superblock_offset": 0,
    "superblock_version": 0,
    "objects": {
@@ -1714,7 +1714,7 @@
      "storage_size": 96,
      "data_offset": 3707,
      "alloc_time": "late",
-     "data": [[0.0,2.6339e-319,2.8363e-319,2.93747e-319],[3.03865e-319,3.08924e-319,3.13984e-319,3.19043e-319],[3.16e-322,2.846e-321,5.375e-321,7.905e-321]],
+     "data": [[0.0,0.25,0.5,0.75],[1.0,1.25,1.5,1.75],[2.0,2.25,2.5,2.75]],
      "attributes": []
     },
     "/array/i32_2x3": {
@@ -2857,7 +2857,7 @@
    "description": "Every datatype class, latest format",
    "libver": "latest",
    "size": 27613,
-   "sha256": "178a352d20f8723ae23d998815b7f24cf2bb097fe949ad513c3656e74aaf84f7",
+   "sha256": "0994e67d8db046f74dab2486b96b5be4a4bede7c72b3fd951623ea0989428f94",
    "superblock_offset": 0,
    "superblock_version": 3,
    "objects": {
@@ -2914,7 +2914,7 @@
      "storage_size": 96,
      "data_offset": 3323,
      "alloc_time": "late",
-     "data": [[0.0,2.6339e-319,2.8363e-319,2.93747e-319],[3.03865e-319,3.08924e-319,3.13984e-319,3.19043e-319],[3.16e-322,2.846e-321,5.375e-321,7.905e-321]],
+     "data": [[0.0,0.25,0.5,0.75],[1.0,1.25,1.5,1.75],[2.0,2.25,2.5,2.75]],
      "attributes": []
     },
     "/array/i32_2x3": {
