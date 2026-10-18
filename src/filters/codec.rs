@@ -7,7 +7,7 @@
 
 use crate::{Error, Result};
 
-fn map_err(name: &'static str) -> impl Fn(compcol::Error) -> Error {
+pub(crate) fn map_err(name: &'static str) -> impl Fn(compcol::Error) -> Error {
     move |e| match e {
         compcol::Error::OutputLimitExceeded => Error::LimitExceeded(name),
         e => Error::invalid(format!("{name}: {e}")),
@@ -20,21 +20,29 @@ fn map_err(name: &'static str) -> impl Fn(compcol::Error) -> Error {
 /// helper stops feeding the decoder once all input is consumed, even when
 /// the decoder still has buffered output to deliver (seen with large bzip2
 /// blocks), and then fails in `finish`.
+///
+/// `capacity` is a pre-allocation hint (0: twice the input size).
 #[cfg(any(
     feature = "zstd",
     feature = "bzip2",
     feature = "blosc",
-    feature = "bitshuffle"
+    feature = "bitshuffle",
+    feature = "lzf"
 ))]
-fn decode_all<A: compcol::Algorithm>(
+pub(crate) fn decode_all<A: compcol::Algorithm>(
     input: &[u8],
+    capacity: usize,
     max_output: usize,
     name: &'static str,
 ) -> Result<Vec<u8>> {
     use compcol::{Decoder, Status};
     let err = map_err(name);
     let mut dec = A::decoder_with(A::DecoderConfig::default());
-    let mut out: Vec<u8> = Vec::with_capacity(input.len().saturating_mul(2).min(max_output));
+    let capacity = match capacity {
+        0 => input.len().saturating_mul(2),
+        n => n,
+    };
+    let mut out: Vec<u8> = Vec::with_capacity(capacity.min(max_output));
     let mut scratch = vec![0u8; 64 << 10];
     let push = |out: &mut Vec<u8>, data: &[u8]| {
         if out.len().saturating_add(data.len()) > max_output {
@@ -72,7 +80,7 @@ fn decode_all<A: compcol::Algorithm>(
 /// Decompresses one Zstandard frame, producing at most `max_output` bytes.
 #[cfg(any(feature = "zstd", feature = "blosc", feature = "bitshuffle"))]
 pub(crate) fn zstd_decompress(input: &[u8], max_output: usize) -> Result<Vec<u8>> {
-    decode_all::<compcol::zstd::Zstd>(input, max_output, "zstd")
+    decode_all::<compcol::zstd::Zstd>(input, 0, max_output, "zstd")
 }
 
 /// Compresses `input` into one Zstandard frame. `level` is clamped to 1–22.
@@ -136,7 +144,7 @@ pub(crate) fn lz4_block_compress(input: &[u8]) -> Vec<u8> {
 /// Decompresses a bzip2 stream, producing at most `max_output` bytes.
 #[cfg(feature = "bzip2")]
 pub(crate) fn bzip2_decompress(input: &[u8], max_output: usize) -> Result<Vec<u8>> {
-    decode_all::<compcol::bzip2::Bzip2>(input, max_output, "bzip2")
+    decode_all::<compcol::bzip2::Bzip2>(input, 0, max_output, "bzip2")
 }
 
 /// Compresses `input` into a bzip2 stream with block size `level` (1–9).
@@ -152,7 +160,7 @@ pub(crate) fn bzip2_compress(input: &[u8], level: u32) -> Result<Vec<u8>> {
 /// Decompresses a raw Snappy block, producing at most `max_output` bytes.
 #[cfg(feature = "blosc")]
 pub(crate) fn snappy_decompress(input: &[u8], max_output: usize) -> Result<Vec<u8>> {
-    decode_all::<compcol::snappy::Snappy>(input, max_output, "snappy")
+    decode_all::<compcol::snappy::Snappy>(input, 0, max_output, "snappy")
 }
 
 /// Compresses `input` into a raw Snappy block.

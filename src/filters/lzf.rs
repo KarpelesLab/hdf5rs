@@ -11,6 +11,8 @@
 //!   `length + 2` bytes are copied from that far back in the output
 //!   (copies may overlap the bytes being produced).
 //!
+//! The codec itself is `compcol`'s LZF implementation (feature `lzf`).
+//!
 //! Client data (as written by h5py): `[filter version, LZF API version,
 //! uncompressed chunk size]`. Decoding uses the chunk size only as a
 //! pre-allocation hint. Encoding fails when the compressed form would not
@@ -46,63 +48,13 @@ impl Filter for Lzf {
     }
 }
 
-/// Maximum back-reference distance.
-const MAX_OFF: usize = 1 << 13;
-/// Maximum literal run length.
-const MAX_LIT: usize = 1 << 5;
-/// Maximum back-reference length (7 + 255 + 2).
-const MAX_REF: usize = 264;
-/// Minimum back-reference length.
-const MIN_REF: usize = 3;
-
 /// Decompresses a raw LZF stream.
 ///
 /// `capacity` is a pre-allocation hint; producing more than `max_output`
 /// bytes fails with [`Error::LimitExceeded`]. Truncated input and
 /// back-references before the start of the output are errors.
 pub fn decompress(input: &[u8], capacity: usize, max_output: usize) -> Result<Vec<u8>> {
-    let truncated = || Error::invalid("lzf: truncated stream");
-    let too_big = || Error::LimitExceeded("lzf output size");
-    let mut out = Vec::with_capacity(capacity.min(max_output));
-    let mut ip = input.iter().copied();
-    while let Some(ctrl) = ip.next() {
-        let ctrl = usize::from(ctrl);
-        if ctrl < MAX_LIT {
-            let run = ctrl + 1;
-            if run > max_output.saturating_sub(out.len()) {
-                return Err(too_big());
-            }
-            let start = out.len();
-            out.extend(ip.by_ref().take(run));
-            if out.len() - start != run {
-                return Err(truncated());
-            }
-        } else {
-            let mut len = ctrl >> 5;
-            if len == 7 {
-                len += usize::from(ip.next().ok_or_else(truncated)?);
-            }
-            len += 2;
-            let back = ((ctrl & 0x1f) << 8 | usize::from(ip.next().ok_or_else(truncated)?)) + 1;
-            let start = out
-                .len()
-                .checked_sub(back)
-                .ok_or_else(|| Error::invalid("lzf: back-reference before start of data"))?;
-            if len > max_output.saturating_sub(out.len()) {
-                return Err(too_big());
-            }
-            if back >= len {
-                out.extend_from_within(start..start + len);
-            } else {
-                // Overlapping copy: the pattern repeats with period `back`.
-                for i in start..start + len {
-                    let b = out[i];
-                    out.push(b);
-                }
-            }
-        }
-    }
-    Ok(out)
+    super::codec::decode_all::<compcol::lzf::Lzf>(input, capacity.max(1), max_output, "lzf")
 }
 
 /// Compresses `input` into a raw LZF stream.
@@ -110,68 +62,8 @@ pub fn decompress(input: &[u8], capacity: usize, max_output: usize) -> Result<Ve
 /// Returns `None` when the result would not be strictly smaller than the
 /// input (including for empty input).
 pub fn compress(input: &[u8]) -> Option<Vec<u8>> {
-    const HASH_BITS: u32 = 14;
-    fn hash(a: u8, b: u8, c: u8) -> usize {
-        let v = u32::from(a) << 16 | u32::from(b) << 8 | u32::from(c);
-        (v.wrapping_mul(0x9E37_79B1) >> (32 - HASH_BITS)) as usize
-    }
-    fn flush_literals(out: &mut Vec<u8>, lit: &[u8]) {
-        for run in lit.chunks(MAX_LIT) {
-            out.push((run.len() - 1) as u8);
-            out.extend_from_slice(run);
-        }
-    }
-
-    let limit = input.len().checked_sub(1)?;
-    let n = input.len();
-    let mut out = Vec::with_capacity(n);
-    // Positions + 1 of the last occurrence of each 3-byte hash; 0 = empty.
-    let mut table = vec![0usize; 1 << HASH_BITS];
-    let mut lit_start = 0;
-    let mut ip = 0;
-    while ip + MIN_REF <= n {
-        let h = hash(input[ip], input[ip + 1], input[ip + 2]);
-        let cand = table[h];
-        table[h] = ip + 1;
-        if let Some(r) = cand.checked_sub(1)
-            && ip - r <= MAX_OFF
-            && input[r..r + MIN_REF] == input[ip..ip + MIN_REF]
-        {
-            let max_len = MAX_REF.min(n - ip);
-            let len = MIN_REF
-                + input[r + MIN_REF..]
-                    .iter()
-                    .zip(&input[ip + MIN_REF..ip + max_len])
-                    .take_while(|(a, b)| a == b)
-                    .count();
-            flush_literals(&mut out, &input[lit_start..ip]);
-            let off = ip - r - 1;
-            let l = len - 2;
-            if l < 7 {
-                out.push(((l << 5) | (off >> 8)) as u8);
-            } else {
-                out.push(((7 << 5) | (off >> 8)) as u8);
-                out.push((l - 7) as u8);
-            }
-            out.push(off as u8);
-            if out.len() >= n {
-                return None;
-            }
-            // Index the positions covered by the match.
-            for p in ip + 1..(ip + len).min(n.saturating_sub(MIN_REF - 1)) {
-                table[hash(input[p], input[p + 1], input[p + 2])] = p + 1;
-            }
-            ip += len;
-            lit_start = ip;
-        } else {
-            ip += 1;
-            if out.len() + (ip - lit_start) >= limit {
-                return None;
-            }
-        }
-    }
-    flush_literals(&mut out, &input[lit_start..]);
-    (out.len() < n).then_some(out)
+    let out = compcol::vec::compress_to_vec::<compcol::lzf::Lzf>(input).ok()?;
+    (out.len() < input.len()).then_some(out)
 }
 
 #[cfg(test)]

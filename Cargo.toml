@@ -12,14 +12,16 @@ categories = ["encoding", "parser-implementations", "science"]
 exclude = ["/.github", "/tests/fixtures", "/tests/regressions", "/tools", "/fuzz"]
 
 [dependencies]
-compcol = { version = "0.7.2", default-features = false, features = ["alloc", "zlib"], optional = true }
+compcol = { version = "0.7.3", default-features = false, features = ["alloc", "zlib"], optional = true }
 
 [dev-dependencies]
 
 [features]
-default = ["deflate"]
+default = ["deflate", "lzf"]
 # The deflate (gzip) filter, via the `compcol` crate.
 deflate = ["dep:compcol"]
+# The LZF filter (id 32000, common in h5py output), via `compcol`.
+lzf = ["dep:compcol", "compcol/lzf"]
 # Zstandard filter (id 32015), via `compcol`.
 zstd = ["dep:compcol", "compcol/zstd"]
 # LZ4 filter (id 32004), via `compcol`.
@@ -34,7 +36,7 @@ bitshuffle = ["dep:compcol", "compcol/lz4", "compcol/zstd"]
 # Decode the chunks of one read on several threads (std::thread::scope).
 parallel = []
 # Every optional filter.
-all-filters = ["deflate", "zstd", "lz4", "bzip2", "blosc", "bitshuffle"]
+all-filters = ["deflate", "lzf", "zstd", "lz4", "bzip2", "blosc", "bitshuffle"]
 
 [lints.rust]
 # `cfg(fuzzing)` is set by cargo-fuzz (and the stress test's checksum-free

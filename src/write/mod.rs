@@ -179,7 +179,7 @@
 //!     .max_shape(&[None])
 //!     .chunk(&[1024])
 //!     .shuffle()
-//!     .deflate(6)
+//!     .fletcher32()
 //!     .create()?;
 //! log.append(&[1.0, 2.0, 3.0])?;
 //! log.append(&[4.0])?;

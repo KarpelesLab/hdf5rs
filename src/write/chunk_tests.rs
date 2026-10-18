@@ -160,7 +160,7 @@ fn small_offsets() {
     assert_eq!(read::<u16>(&f, "bt"), (0..400u16).collect::<Vec<_>>());
 }
 
-#[cfg(feature = "deflate")]
+#[cfg(all(feature = "deflate", feature = "lzf"))]
 #[test]
 fn filter_combinations() {
     for v in [0u8, 2, 3] {
@@ -234,6 +234,7 @@ fn filter_combinations() {
 }
 
 #[test]
+#[cfg(feature = "lzf")]
 fn optional_filter_failure_sets_mask() {
     for v in [0u8, 3] {
         let mut w = writer(v);

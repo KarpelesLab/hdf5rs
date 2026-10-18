@@ -12,8 +12,9 @@ clean-room policy in the README).
 
 - **Minimal dependencies.** The only dependency is our own pure-Rust
   [`compcol`](https://crates.io/crates/compcol) compression crate, optional
-  behind per-codec features (`deflate` on by default). Format-specific
-  filters (shuffle, Fletcher-32, LZF, N-bit, scale-offset) live in-crate.
+  behind per-codec features (`deflate` and `lzf` on by default).
+  Format-specific filters (shuffle, Fletcher-32, N-bit, scale-offset) live
+  in-crate.
 - **No `unsafe`.** Enforced with `#![forbid(unsafe_code)]`.
 - **Never panic on bad input.** Every parser returns `Result`; malformed or
   hostile files must produce errors, not panics, infinite loops, or unbounded
@@ -103,12 +104,12 @@ Goal: read the vast majority of real-world files, including compressed ones.
   - [x] single chunk, implicit, fixed array (`FAHD`/`FADB`), extensible array
         (`EAHD`/`EAIB`/`EASB`/`EADB`), v2 B-tree — layout v4
 - [x] Filter pipeline message (versions 1 and 2), per-chunk filter masks
-- [x] Filters implemented in-crate:
+- [x] Filters:
   - [x] deflate (zlib) — via `compcol`
   - [x] shuffle
   - [x] Fletcher-32 (verified against fixtures)
   - [x] N-bit and scale-offset
-  - [x] LZF (common in h5py output; verified against fixtures)
+  - [x] LZF (common in h5py output; via `compcol`, verified against fixtures)
 - [x] Pluggable filters: a `Filter` trait plus registry so users can add
       codecs without the core depending on them
 - [x] Optional `compcol`-backed features: `zstd`, `lz4`, `bzip2`, `blosc`,

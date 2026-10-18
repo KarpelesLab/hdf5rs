@@ -14,8 +14,8 @@
 //! - a [`FilterRegistry`] mapping filter ids to implementations,
 //! - [`decode_pipeline`] / [`encode_pipeline`] which run a pipeline
 //!   description ([`PipelineStep`]s) over one chunk,
-//! - built-in codecs: `deflate` (feature `deflate`), [`shuffle`],
-//!   [`fletcher32`], [`lzf`], [`nbit`], [`scaleoffset`],
+//! - built-in codecs: `deflate` (feature `deflate`), `lzf` (feature
+//!   `lzf`), [`shuffle`], [`fletcher32`], [`nbit`], [`scaleoffset`],
 //! - optional codecs backed by `compcol`, each behind its own Cargo feature
 //!   (all enabled by `all-filters`): `zstd`, `lz4`, `bzip2`, `blosc` and
 //!   `bitshuffle`.
@@ -38,7 +38,8 @@ pub mod bzip2;
     feature = "lz4",
     feature = "bzip2",
     feature = "blosc",
-    feature = "bitshuffle"
+    feature = "bitshuffle",
+    feature = "lzf"
 ))]
 mod codec;
 #[cfg(any(feature = "deflate", feature = "blosc"))]
@@ -46,6 +47,7 @@ pub mod deflate;
 pub mod fletcher32;
 #[cfg(feature = "lz4")]
 pub mod lz4;
+#[cfg(feature = "lzf")]
 pub mod lzf;
 pub mod nbit;
 pub mod scaleoffset;
@@ -164,6 +166,16 @@ impl FilterContext {
     /// A pre-allocation size derived from `hint` (and the expected size),
     /// clamped to [`FilterContext::max_output`] and a modest absolute bound
     /// so untrusted hints cannot force huge allocations up front.
+    #[cfg_attr(
+        not(any(
+            feature = "deflate",
+            feature = "lzf",
+            feature = "lz4",
+            feature = "blosc",
+            feature = "bitshuffle"
+        )),
+        allow(dead_code)
+    )]
     pub(crate) fn capacity_hint(&self, hint: Option<usize>) -> usize {
         const MAX_PREALLOC: usize = 64 << 20;
         hint.or(self.expected_size)
@@ -261,8 +273,9 @@ impl FilterRegistry {
     }
 
     /// A registry with the built-in filters: deflate (feature `deflate`),
-    /// shuffle, fletcher32, N-bit, scale-offset and lzf, plus the optional
-    /// filters whose features are enabled: zstd, lz4, bzip2, blosc and
+    /// lzf (feature `lzf`), shuffle, fletcher32, N-bit and scale-offset,
+    /// plus the optional filters whose features are enabled: zstd, lz4,
+    /// bzip2, blosc and
     /// bitshuffle.
     pub fn with_builtin() -> Self {
         let mut r = FilterRegistry::new();
@@ -270,6 +283,7 @@ impl FilterRegistry {
         r.register(Box::new(Deflate));
         r.register(Box::new(shuffle::Shuffle));
         r.register(Box::new(fletcher32::Fletcher32));
+        #[cfg(feature = "lzf")]
         r.register(Box::new(lzf::Lzf));
         r.register(Box::new(nbit::NBit));
         r.register(Box::new(scaleoffset::ScaleOffset));
@@ -483,7 +497,7 @@ mod tests {
         }
         for (id, on) in [
             (BZIP2, cfg!(feature = "bzip2")),
-            (LZF, true),
+            (LZF, cfg!(feature = "lzf")),
             (BLOSC, cfg!(feature = "blosc")),
             (LZ4, cfg!(feature = "lz4")),
             (BITSHUFFLE, cfg!(feature = "bitshuffle")),
@@ -615,6 +629,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "lzf")]
     fn builtin_pipeline_roundtrip() {
         // shuffle -> fletcher32 -> lzf(optional), as h5py might configure.
         let r = FilterRegistry::with_builtin();
