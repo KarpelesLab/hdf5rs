@@ -493,6 +493,96 @@ impl SingleChunkIndex {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Encoding (write side)
+// ---------------------------------------------------------------------------
+
+/// One encoded on-disk block of an index structure, to be written at
+/// `address`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EncodedBlock {
+    /// Where the block goes.
+    pub address: u64,
+    /// The block's bytes (checksums included).
+    pub bytes: Vec<u8>,
+}
+
+/// An encoded index structure: the address recorded in the layout message
+/// and every block to write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EncodedIndex {
+    /// Address of the structure's header (or root).
+    pub address: u64,
+    /// Blocks to write.
+    pub blocks: Vec<EncodedBlock>,
+}
+
+/// Space allocator callback used by the index encoders: reserves `size`
+/// bytes and returns their address.
+pub type AllocFn<'a> = dyn FnMut(u64) -> Result<u64> + 'a;
+
+/// Width in bytes of the "Chunk Size" field of filtered chunk elements in
+/// layout version 4 indexes, for chunks of `chunk_bytes` unfiltered bytes:
+/// one byte more than needed to encode the unfiltered size, at most 8
+/// (observed in files written by the reference library).
+pub fn filtered_chunk_size_width_v4(chunk_bytes: u64) -> u8 {
+    let bits = 64 - chunk_bytes.leading_zeros();
+    let needed = bits.div_ceil(8).max(1);
+    (needed + 1).min(8) as u8
+}
+
+impl ElementCodec {
+    /// Codec for encoding elements: filtered elements use a `size_width`
+    /// byte chunk size field.
+    pub(crate) fn for_encoding(sizes: Sizes, filtered: bool, size_width: u8) -> Result<Self> {
+        let offset = usize::from(sizes.offset);
+        let element_size = if filtered {
+            if !(1..=8).contains(&size_width) {
+                return Err(Error::invalid("filtered chunk size width must be 1..=8"));
+            }
+            offset + usize::from(size_width) + 4
+        } else {
+            offset
+        };
+        Ok(ElementCodec {
+            sizes,
+            filtered,
+            size_width: if filtered { size_width } else { 0 },
+            element_size,
+        })
+    }
+
+    /// Append one element. Unallocated records encode as an undefined
+    /// address (with a zero size and mask when filtered).
+    pub(crate) fn encode(&self, w: &mut super::ByteWriter, rec: &ChunkRecord) -> Result<()> {
+        w.write_offset(rec.address)?;
+        if self.filtered {
+            let (size, mask) = if rec.is_allocated() {
+                (rec.size.unwrap_or(0), rec.filter_mask)
+            } else {
+                (0, 0)
+            };
+            w.write_uint(size, usize::from(self.size_width))?;
+            w.u32(mask);
+        }
+        Ok(())
+    }
+}
+
+/// Append the metadata checksum of everything written so far.
+pub(crate) fn seal_block(mut w: super::ByteWriter) -> Vec<u8> {
+    let sum = metadata_checksum(w.as_slice());
+    w.u32(sum);
+    w.into_vec()
+}
+
+/// Set bit `i` (most significant bit first, see [`bitmap_bit`]).
+pub(crate) fn set_bitmap_bit(bitmap: &mut [u8], i: u64) {
+    if let Some(b) = usize::try_from(i / 8).ok().and_then(|n| bitmap.get_mut(n)) {
+        *b |= 0x80u8 >> (i % 8);
+    }
+}
+
 /// Helpers for building index structures byte by byte in tests.
 #[cfg(test)]
 pub(crate) mod testutil {
@@ -677,5 +767,42 @@ mod tests {
         ctx.chunk_size_width = Some(2);
         assert!(ElementCodec::new(&ctx, 1, 16).is_err());
         assert!(ElementCodec::new(&ctx, 1, 14).is_ok());
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod encode_testutil {
+    use super::{EncodedIndex, Result};
+
+    /// A bump allocator starting at `base`, for encoder tests.
+    pub fn bump(base: u64) -> impl FnMut(u64) -> Result<u64> {
+        let mut next = base;
+        move |size| {
+            let a = next;
+            next += size;
+            Ok(a)
+        }
+    }
+
+    /// Write every block of `idx` into `file`, growing it as needed.
+    pub fn apply(idx: &EncodedIndex, file: &mut Vec<u8>) {
+        for b in &idx.blocks {
+            let start = b.address as usize;
+            let end = start + b.bytes.len();
+            if file.len() < end {
+                file.resize(end, 0);
+            }
+            file[start..end].copy_from_slice(&b.bytes);
+        }
+    }
+
+    #[test]
+    fn size_width_matches_reference_files() {
+        // 16-byte and 24-byte chunks: 2 bytes; 256 bytes: 3; huge: 8.
+        assert_eq!(super::filtered_chunk_size_width_v4(16), 2);
+        assert_eq!(super::filtered_chunk_size_width_v4(24), 2);
+        assert_eq!(super::filtered_chunk_size_width_v4(255), 2);
+        assert_eq!(super::filtered_chunk_size_width_v4(256), 3);
+        assert_eq!(super::filtered_chunk_size_width_v4(u64::MAX), 8);
     }
 }

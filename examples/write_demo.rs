@@ -3,16 +3,21 @@
 //! `cargo run --example write_demo -- out.h5 [v0|v2|v3] [o4] [times]`
 //!
 //! `o4` uses 4-byte offsets and lengths; `times` stores object timestamps.
+//! The `/chunked` group holds chunked, filtered and resizable datasets
+//! (chunk indexes: v1 B-tree for superblocks 0 and 2, the version 4
+//! indexes for superblock 3).
 //!
 //! `tools/check_written.py` verifies the result with h5py.
 
 use hdf5rs::format::Sizes;
 use hdf5rs::format::messages::datatype::{
-    ByteOrder, CharacterSet, CompoundMember, Datatype, StringPadding,
+    ByteOrder, CharacterSet, CompoundMember, Datatype, DatatypeClass, StringPadding,
 };
 use hdf5rs::write::{
-    EncodeContext, FileWriter, FixedAscii, H5Write, Layout, ObjectRef, WriteOptions,
+    AllocTime, EncodeContext, FileWriter, FixedAscii, GroupWriter, H5Write, Layout, ObjectRef,
+    ScaleOffsetMode, WriteOptions,
 };
+use hdf5rs::{HyperslabDim, Selection};
 
 /// A compound element.
 struct Point {
@@ -232,6 +237,7 @@ fn main() -> hdf5rs::Result<()> {
         huge.set_attr("blob", &blob)?;
         huge.set_attr("note", "a dense group")?;
     }
+    write_chunked(&mut root)?;
     {
         let mut deep = root.create_group("a")?;
         let mut b = deep.create_group("b")?;
@@ -241,5 +247,187 @@ fn main() -> hdf5rs::Result<()> {
     }
     f.finish()?;
     println!("wrote {path}");
+    Ok(())
+}
+
+/// Chunked, filtered and resizable datasets (checked by
+/// `tools/check_written.py`).
+fn write_chunked(root: &mut GroupWriter<'_, std::fs::File>) -> hdf5rs::Result<()> {
+    let mut g = root.create_group("chunked")?;
+    let iota = |n: i32| (0..n).collect::<Vec<i32>>();
+    // One per chunk index type (superblock 3).
+    g.new_dataset::<i32>("single")
+        .chunk(&[10])
+        .write(&iota(10))?;
+    g.new_dataset::<i32>("farray")
+        .shape(&[6, 10])
+        .chunk(&[4, 4])
+        .write(&iota(60))?;
+    g.new_dataset::<i32>("farray_paged")
+        .chunk(&[2])
+        .write(&iota(5001))?;
+    g.new_dataset::<i32>("implicit")
+        .shape(&[5, 7])
+        .chunk(&[2, 3])
+        .alloc_time(AllocTime::Early)
+        .write(&iota(35))?;
+    g.new_dataset::<i32>("earray")
+        .shape(&[3, 700, 2])
+        .max_shape(&[Some(3), None, Some(4)])
+        .chunk(&[2, 1, 2])
+        .write(&iota(4200))?;
+    g.new_dataset::<i32>("btree2")
+        .shape(&[60, 70])
+        .max_shape(&[None, None])
+        .chunk(&[1, 1])
+        .write(&iota(4200))?;
+    // The same indexes with filtered chunks.
+    g.new_dataset::<i32>("single_gz")
+        .chunk(&[10])
+        .deflate(4)
+        .write(&iota(10))?;
+    g.new_dataset::<i32>("farray_gz")
+        .chunk(&[2])
+        .deflate(1)
+        .write(&iota(5001))?;
+    g.new_dataset::<i32>("earray_gz")
+        .max_shape(&[None])
+        .chunk(&[4])
+        .shuffle()
+        .deflate(1)
+        .write(&iota(20000))?;
+    g.new_dataset::<i32>("btree2_gz")
+        .shape(&[40, 50])
+        .max_shape(&[None, None])
+        .chunk(&[1, 1])
+        .deflate(1)
+        .fletcher32()
+        .write(&iota(2000))?;
+    // Filters.
+    let data: Vec<i32> = (0..1000).map(|i| (i % 37) * 3).collect();
+    g.new_dataset::<i32>("gzip")
+        .chunk(&[128])
+        .deflate(6)
+        .write(&data)?;
+    g.new_dataset::<i32>("shuf_gzip_f32")
+        .chunk(&[100])
+        .shuffle()
+        .deflate(9)
+        .fletcher32()
+        .write(&data)?;
+    g.new_dataset::<i32>("lzf")
+        .chunk(&[256])
+        .lzf()
+        .write(&data)?;
+    let mut x = 0x1234_5678u32;
+    let mut mixed: Vec<u32> = (0..64)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            x
+        })
+        .collect();
+    mixed.extend(std::iter::repeat_n(7u32, 64));
+    g.new_dataset::<u32>("lzf_mixed")
+        .chunk(&[64])
+        .lzf()
+        .write(&mixed)?;
+    let mut i12 = Datatype::integer(2, true, ByteOrder::LittleEndian);
+    if let DatatypeClass::FixedPoint(fp) = &mut i12.class {
+        fp.bit_precision = 12;
+    }
+    let raw: Vec<u8> = (-500i16..500).flat_map(|v| v.to_le_bytes()).collect();
+    g.new_dataset_with_type("nbit", i12)
+        .chunk(&[100])
+        .nbit()
+        .write_raw(&raw)?;
+    g.new_dataset::<i32>("so_int")
+        .chunk(&[64])
+        .scale_offset(ScaleOffsetMode::Integer { min_bits: 0 })
+        .write(&data)?;
+    let floats: Vec<f32> = (0..300).map(|i| i as f32 * 0.25).collect();
+    g.new_dataset::<f32>("so_float")
+        .chunk(&[50])
+        .scale_offset(ScaleOffsetMode::FloatDecimal { decimal_digits: 2 })
+        .write(&floats)?;
+    g.new_dataset::<i32>("partial")
+        .chunk(&[4])
+        .deflate(5)
+        .dont_filter_partial_chunks()
+        .write(&iota(10))?;
+    g.new_dataset::<i32>("edge2d")
+        .shape(&[25, 40])
+        .chunk(&[7, 9])
+        .shuffle()
+        .deflate(4)
+        .write(&iota(1000))?;
+    g.new_dataset::<f64>("auto")
+        .deflate(1)
+        .max_shape(&[None])
+        .write(&[1.0, 2.0])?;
+    // Resizable datasets.
+    {
+        let mut log = g
+            .new_dataset::<i32>("log")
+            .shape(&[0])
+            .max_shape(&[None])
+            .chunk(&[16])
+            .deflate(1)
+            .fill_value(-1)?
+            .create()?;
+        for i in 0..100 {
+            log.append(&(0..7).map(|k| i * 7 + k).collect::<Vec<_>>())?;
+        }
+        log.resize(&[710])?;
+    }
+    {
+        let mut t = g
+            .new_dataset::<f64>("table")
+            .shape(&[0, 3])
+            .max_shape(&[None, Some(3)])
+            .chunk(&[4, 3])
+            .create()?;
+        for r in 0..10 {
+            let r = f64::from(r);
+            t.append(&[r, r + 0.5, -r])?;
+        }
+    }
+    g.new_dataset::<i32>("empty_ext")
+        .shape(&[0, 4])
+        .max_shape(&[None, None])
+        .chunk(&[2, 2])
+        .create()?;
+    g.new_dataset::<i16>("fill_early")
+        .shape(&[9])
+        .chunk(&[4])
+        .alloc_time(AllocTime::Early)
+        .fill_value(-5)?
+        .create()?;
+    {
+        let mut h = g
+            .new_dataset::<u16>("hyper")
+            .shape(&[20, 30])
+            .chunk(&[6, 7])
+            .deflate(2)
+            .create()?;
+        let sel = Selection::hyperslab(vec![
+            HyperslabDim::new(1, 4, 3, 2),
+            HyperslabDim::range(3..13),
+        ]);
+        h.write_selection(&sel, &(0..60).map(|i| 1000 + i).collect::<Vec<u16>>())?;
+        let row: Vec<u16> = (0..30).collect();
+        h.write_selection(&Selection::from_ranges(&[19..20, 0..30]), &row)?;
+    }
+    {
+        let mut names = g
+            .new_dataset::<String>("names")
+            .shape(&[0])
+            .max_shape(&[None])
+            .chunk(&[2])
+            .create()?;
+        names.append(&["a".to_string(), "bb".into(), "ccc".into()])?;
+        names.append(&["dddd".to_string()])?;
+    }
     Ok(())
 }

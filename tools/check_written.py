@@ -59,7 +59,8 @@ def check_root(f):
     fdt = a.get_id("fixed").dtype
     check(fdt == np.dtype("S8"), f"/@fixed dtype {fdt}")
     check(
-        sorted(f.keys()) == ["a", "links", "many", "numbers", "strings", "types"],
+        sorted(f.keys()) == ["a", "chunked", "links", "many", "numbers", "strings",
+                         "types"],
         f"root members {sorted(f.keys())}",
     )
 
@@ -227,6 +228,191 @@ def visit_all(f):
     return len(seen)
 
 
+CHUNK_DATA = np.array([(i % 37) * 3 for i in range(1000)], dtype="i4")
+
+
+def lzf_mixed_values():
+    x = 0x12345678
+    out = []
+    for _ in range(64):
+        x ^= (x << 13) & 0xFFFFFFFF
+        x ^= x >> 17
+        x ^= (x << 5) & 0xFFFFFFFF
+        out.append(x)
+    return np.array(out + [7] * 64, dtype="u4")
+
+
+def hyper_values():
+    h = np.zeros((20, 30), dtype="u2")
+    vals = iter(range(1000, 1060))
+    for r in (1, 2, 5, 6, 9, 10):
+        for c in range(3, 13):
+            h[r, c] = next(vals)
+    h[19, :] = np.arange(30)
+    return h
+
+
+def log_values():
+    v = np.arange(700, dtype="i4")
+    return np.concatenate([v, np.full(10, -1, dtype="i4")])
+
+
+def chunk_masks(d):
+    """Filter masks of every stored chunk, in storage order."""
+    n = d.id.get_num_chunks()
+    return [d.id.get_chunk_info(i).filter_mask for i in range(n)]
+
+
+def check_chunked(f):
+    g = f["chunked"]
+    iota = lambda n: np.arange(n, dtype="i4")  # noqa: E731
+
+    def ds(name, shape, chunks, maxshape=None, values=None, compression=None):
+        d = g[name]
+        check(d.shape == shape, f"chunked/{name} shape {d.shape} != {shape}")
+        check(d.chunks == chunks, f"chunked/{name} chunks {d.chunks} != {chunks}")
+        want_max = maxshape if maxshape is not None else shape
+        if f.id.get_create_plist().get_sizes()[1] == 4:
+            # With 4-byte lengths the reference library reads the all-ones
+            # "unlimited" pattern back as 2**32 - 1 (also in files it
+            # writes itself).
+            want_max = tuple(2**32 - 1 if m is None else m for m in want_max)
+        check(d.maxshape == want_max, f"chunked/{name} maxshape {d.maxshape} != {want_max}")
+        if compression is not False:
+            check(d.compression == compression,
+                  f"chunked/{name} compression {d.compression} != {compression}")
+        if values is not None:
+            eq(d[()], values, f"chunked/{name} values")
+        return d
+
+    ds("single", (10,), (10,), values=iota(10))
+    ds("farray", (6, 10), (4, 4), values=iota(60).reshape(6, 10))
+    ds("farray_paged", (5001,), (2,), values=iota(5001))
+    d = ds("implicit", (5, 7), (2, 3), values=iota(35).reshape(5, 7))
+    check(d.id.get_create_plist().get_alloc_time() == h5py.h5d.ALLOC_TIME_EARLY,
+          "implicit alloc time early")
+    ds("earray", (3, 700, 2), (2, 1, 2), (3, None, 4), iota(4200).reshape(3, 700, 2))
+    ds("btree2", (60, 70), (1, 1), (None, None), iota(4200).reshape(60, 70))
+    ds("single_gz", (10,), (10,), values=iota(10), compression="gzip")
+    ds("farray_gz", (5001,), (2,), values=iota(5001), compression="gzip")
+    ds("earray_gz", (20000,), (4,), (None,), iota(20000), compression="gzip")
+    d = ds("btree2_gz", (40, 50), (1, 1), (None, None), iota(2000).reshape(40, 50),
+           compression="gzip")
+    check(d.fletcher32, "btree2_gz fletcher32")
+    d = ds("gzip", (1000,), (128,), values=CHUNK_DATA, compression="gzip")
+    check(d.compression_opts == 6, f"gzip level {d.compression_opts}")
+    check(all(c.size < 512 for c in
+              (d.id.get_chunk_info(i) for i in range(d.id.get_num_chunks()))),
+          "gzip chunks are compressed")
+    d = ds("shuf_gzip_f32", (1000,), (100,), values=CHUNK_DATA, compression="gzip")
+    check(d.shuffle and d.fletcher32 and d.compression_opts == 9,
+          f"shuf_gzip_f32 filters {d.shuffle} {d.fletcher32} {d.compression_opts}")
+    ds("lzf", (1000,), (256,), values=CHUNK_DATA, compression="lzf")
+    d = ds("lzf_mixed", (128,), (64,), values=lzf_mixed_values(), compression="lzf")
+    eq(chunk_masks(d), [1, 0], "lzf_mixed filter masks (optional filter skipped)")
+    # h5py names no compression for N-bit (it reports "unknown").
+    d = ds("nbit", (1000,), (100,), values=np.arange(-500, 500, dtype="i2"),
+           compression=False)
+    check(d.id.get_create_plist().get_filter(0)[0] == h5py.h5z.FILTER_NBIT, "nbit filter")
+    d = ds("so_int", (1000,), (64,), values=CHUNK_DATA)
+    check(d.scaleoffset == 0, f"so_int scaleoffset {d.scaleoffset}")
+    d = ds("so_float", (300,), (50,), values=np.arange(300, dtype="f4") * 0.25)
+    check(d.scaleoffset == 2, f"so_float scaleoffset {d.scaleoffset}")
+    d = ds("partial", (10,), (4,), values=iota(10), compression="gzip")
+    eq(chunk_masks(d)[-1], 1, "partial edge chunk stored unfiltered")
+    ds("edge2d", (25, 40), (7, 9), values=iota(1000).reshape(25, 40), compression="gzip")
+    ds("auto", (2,), (1024,), (None,), [1.0, 2.0], compression="gzip")
+    d = ds("log", (710,), (16,), (None,), log_values(), compression="gzip")
+    eq(d.fillvalue, -1, "log fill value")
+    t = np.array([[r, r + 0.5, -r] for r in range(10)], dtype="f8")
+    ds("table", (10, 3), (4, 3), (None, 3), t)
+    ds("empty_ext", (0, 4), (2, 2), (None, None), np.zeros((0, 4), dtype="i4"))
+    ds("fill_early", (9,), (4,), values=np.full(9, -5, dtype="i2"))
+    ds("hyper", (20, 30), (6, 7), values=hyper_values(), compression="gzip")
+    d = ds("names", (4,), (2,), (None,))
+    eq([s(x) for x in d[()]], ["a", "bb", "ccc", "dddd"], "chunked/names values")
+
+
+def modify_chunked(f):
+    """Resize, append and overwrite our chunked datasets with the
+    reference library."""
+    g = f["chunked"]
+    d = g["log"]
+    d.resize((720,))
+    d[710:720] = np.arange(10) + 5000
+    t = g["table"]
+    t.resize((12, 3))
+    t[10:12] = [[10, 10.5, -10], [11, 11.5, -11]]
+    e = g["earray"]
+    e.resize((3, 710, 2))
+    e[:, 700:710, :] = -np.ones((3, 10, 2))
+    b = g["btree2"]
+    b.resize((62, 72))
+    b[60:62, :] = 7
+    b[:60, 70:72] = 8
+    x = g["empty_ext"]
+    x.resize((5, 6))
+    x[...] = np.arange(30).reshape(5, 6)
+    g["farray"][0, 0] = 99
+    g["single_gz"][0] = -9
+    g["farray_gz"][4000:4010] = -9
+    eg = g["earray_gz"]
+    eg.resize((40000,))
+    eg[20000:] = -np.arange(20000)
+    bg = g["btree2_gz"]
+    bg.resize((41, 50))
+    bg[40, :] = -2
+    g["gzip"][10:20] = -3
+    g["implicit"][4, 6] = -1
+    g["single"][3] = 33
+    n = g["names"]
+    n.resize((5,))
+    n[4] = "eeeee"
+    g.create_dataset("by_h5py", data=np.arange(100), chunks=(7,), maxshape=(None,),
+                     compression="gzip")
+
+
+def check_modified_chunked(f):
+    g = f["chunked"]
+    want = np.concatenate([log_values(), np.arange(10) + 5000])
+    eq(g["log"][()], want, "modified log")
+    t = np.array([[r, r + 0.5, -r] for r in range(12)], dtype="f8")
+    eq(g["table"][()], t, "modified table")
+    e = np.arange(4200, dtype="i4").reshape(3, 700, 2)
+    e = np.concatenate([e, -np.ones((3, 10, 2), dtype="i4")], axis=1)
+    eq(g["earray"][()], e, "modified earray")
+    b = np.zeros((62, 72), dtype="i4")
+    b[:60, :70] = np.arange(4200).reshape(60, 70)
+    b[60:62, :] = 7
+    b[:60, 70:72] = 8
+    eq(g["btree2"][()], b, "modified btree2")
+    eq(g["empty_ext"][()], np.arange(30).reshape(5, 6), "modified empty_ext")
+    fa = np.arange(60).reshape(6, 10)
+    fa[0, 0] = 99
+    eq(g["farray"][()], fa, "modified farray")
+    gz = CHUNK_DATA.copy()
+    gz[10:20] = -3
+    eq(g["gzip"][()], gz, "modified gzip")
+    im = np.arange(35).reshape(5, 7)
+    im[4, 6] = -1
+    eq(g["implicit"][()], im, "modified implicit")
+    si = np.arange(10)
+    si[3] = 33
+    eq(g["single"][()], si, "modified single")
+    eq([s(x) for x in g["names"][()]], ["a", "bb", "ccc", "dddd", "eeeee"], "modified names")
+    eq(g["by_h5py"][()], np.arange(100), "dataset created by h5py")
+    sg = np.arange(10)
+    sg[0] = -9
+    eq(g["single_gz"][()], sg, "modified single_gz")
+    fg = np.arange(5001)
+    fg[4000:4010] = -9
+    eq(g["farray_gz"][()], fg, "modified farray_gz")
+    eq(g["earray_gz"][()], np.concatenate([np.arange(20000), -np.arange(20000)]),
+       "modified earray_gz")
+    bg = np.concatenate([np.arange(2000).reshape(40, 50), np.full((1, 50), -2)])
+    eq(g["btree2_gz"][()], bg, "modified btree2_gz")
+
+
 def check_modify(path):
     """Modify a copy with the reference library (exercises its view of our
     metadata: phase-change values, reference counts, free space) and check
@@ -246,6 +432,7 @@ def check_modify(path):
             f["numbers/grid"].attrs["added"] = "yes"
             f.create_dataset("new/data", data=np.arange(5))
             del f["links/dangling"]
+            modify_chunked(f)
             f["a/b/c"].attrs["depth"] = 4
             h = f["many/huge"]
             h.create_group("added")
@@ -273,6 +460,7 @@ def check_modify(path):
             eq(f["new/data"][()], np.arange(5), "new dataset")
             check("dangling" not in f["links"], "deleted link")
             eq(f["a/b/c"].attrs["depth"], 4, "rewritten attr")
+            check_modified_chunked(f)
             visit_all(f)
 
 
@@ -281,7 +469,7 @@ def main(path):
         sb = f.id.get_create_plist().get_version()[0]
         print(f"{path}: superblock v{sb}, libhdf5 {h5py.version.hdf5_version}")
         for fn in (check_root, check_numbers, check_strings, check_types,
-                   check_links, check_many):
+                   check_links, check_many, check_chunked):
             try:
                 fn(f)
             except Exception as e:  # noqa: BLE001 - report and continue

@@ -441,6 +441,157 @@ impl BTreeNode {
         w.zeros(Self::group_node_size(sizes, k) - w.len());
         Ok(w.into_vec())
     }
+
+    /// Size of a chunk (type 1) node of a rank-`ndims` dataset with room
+    /// for `2 * k` children.
+    pub fn chunk_node_size(sizes: Sizes, k: u16, ndims: usize) -> usize {
+        let k2 = 2 * usize::from(k);
+        header_size(sizes)
+            + (k2 + 1) * key_size(NodeType::Chunk, sizes, ndims)
+            + k2 * sizes.offset as usize
+    }
+
+    /// Encode a chunk (type 1) node at its full size for chunk B-tree K
+    /// `k`. Keys carry a zero trailing datatype offset, except the final
+    /// key, which carries `last_key_trailing` (the reference library puts
+    /// the element size in the right-most key of a tree).
+    pub fn encode_chunk(&self, sizes: Sizes, k: u16, last_key_trailing: u64) -> Result<Vec<u8>> {
+        let Keys::Chunk(keys) = &self.keys else {
+            return Err(Error::invalid("not a chunk B-tree node"));
+        };
+        let ndims = keys.first().map_or(0, |key| key.offsets.len());
+        check_rank(ndims)?;
+        if self.node_type != NodeType::Chunk
+            || keys.len() != self.children.len() + 1
+            || self.children.len() > 2 * usize::from(k)
+            || keys.iter().any(|key| key.offsets.len() != ndims)
+        {
+            return Err(Error::invalid("malformed chunk B-tree node"));
+        }
+        let mut w = ByteWriter::with_sizes(sizes);
+        w.bytes(&BTREE_V1_SIGNATURE)
+            .u8(1)
+            .u8(self.level)
+            .u16(self.children.len() as u16);
+        w.write_offset(self.left_sibling)?;
+        w.write_offset(self.right_sibling)?;
+        let put_key = |w: &mut ByteWriter, key: &ChunkKey, trailing: u64| {
+            w.u32(key.size).u32(key.filter_mask);
+            for &o in &key.offsets {
+                w.u64(o);
+            }
+            w.u64(trailing);
+        };
+        for (key, child) in keys.iter().zip(&self.children) {
+            put_key(&mut w, key, 0);
+            w.write_offset(*child)?;
+        }
+        if let Some(last) = keys.last() {
+            put_key(&mut w, last, last_key_trailing);
+        }
+        w.zeros(Self::chunk_node_size(sizes, k, ndims) - w.len());
+        Ok(w.into_vec())
+    }
+}
+
+/// Bulk-load a chunk (type 1) v1 B-tree indexing `entries`, which must be
+/// sorted by offsets (lexicographically, slowest dimension first) and
+/// non-empty.
+///
+/// Every node is allocated at its full size for K = `k` (at most `2k`
+/// children), nodes of a level are linked through their sibling pointers,
+/// and entries are spread evenly over the leaves. The right-most key of the
+/// tree is `end_key` (with `last_key_trailing` as its datatype offset); the
+/// right key of any other node is the left key of its right neighbour.
+pub fn encode_chunk_btree(
+    sizes: Sizes,
+    k: u16,
+    entries: &[ChunkEntry],
+    end_key: &ChunkKey,
+    last_key_trailing: u64,
+    alloc: &mut super::chunk_index::AllocFn<'_>,
+) -> Result<super::chunk_index::EncodedIndex> {
+    use super::chunk_index::{EncodedBlock, EncodedIndex};
+    let fanout = 2 * usize::from(k);
+    if entries.is_empty() || fanout == 0 {
+        return Err(Error::invalid("chunk B-tree needs entries and K > 0"));
+    }
+    let ndims = end_key.offsets.len();
+    let node_size = BTreeNode::chunk_node_size(sizes, k, ndims) as u64;
+    // Current level: (left key, child address) pairs.
+    let mut level_items: Vec<(ChunkKey, u64)> = entries
+        .iter()
+        .map(|e| {
+            (
+                ChunkKey {
+                    size: e.size,
+                    filter_mask: e.filter_mask,
+                    offsets: e.offsets.clone(),
+                },
+                e.address,
+            )
+        })
+        .collect();
+    let mut blocks = Vec::new();
+    let mut level = 0u8;
+    loop {
+        let nnodes = level_items.len().div_ceil(fanout);
+        let (base, extra) = (level_items.len() / nnodes, level_items.len() % nnodes);
+        let addrs = (0..nnodes)
+            .map(|_| alloc(node_size))
+            .collect::<Result<Vec<u64>>>()?;
+        let mut next = Vec::with_capacity(nnodes);
+        let mut pos = 0usize;
+        for i in 0..nnodes {
+            let take = base + usize::from(i < extra);
+            let items = level_items
+                .get(pos..pos + take)
+                .ok_or_else(|| Error::invalid("chunk B-tree bulk load range"))?;
+            pos += take;
+            let right = match level_items.get(pos) {
+                Some((key, _)) if i + 1 < nnodes => key.clone(),
+                _ => end_key.clone(),
+            };
+            let mut keys: Vec<ChunkKey> = items.iter().map(|(key, _)| key.clone()).collect();
+            keys.push(right);
+            let node = BTreeNode {
+                node_type: NodeType::Chunk,
+                level,
+                left_sibling: if i == 0 {
+                    UNDEFINED_ADDRESS
+                } else {
+                    addrs[i - 1]
+                },
+                right_sibling: addrs.get(i + 1).copied().unwrap_or(UNDEFINED_ADDRESS),
+                keys: Keys::Chunk(keys),
+                children: items.iter().map(|(_, a)| *a).collect(),
+            };
+            let trailing = if i + 1 == nnodes {
+                last_key_trailing
+            } else {
+                0
+            };
+            blocks.push(EncodedBlock {
+                address: addrs[i],
+                bytes: node.encode_chunk(sizes, k, trailing)?,
+            });
+            let first = items
+                .first()
+                .map(|(key, _)| key.clone())
+                .ok_or_else(|| Error::invalid("empty chunk B-tree node"))?;
+            next.push((first, addrs[i]));
+        }
+        if nnodes == 1 {
+            return Ok(EncodedIndex {
+                address: addrs[0],
+                blocks,
+            });
+        }
+        level_items = next;
+        level = level
+            .checked_add(1)
+            .ok_or(Error::LimitExceeded("chunk B-tree depth"))?;
+    }
 }
 
 #[cfg(test)]
@@ -641,5 +792,81 @@ mod tests {
         assert_eq!(enc.len(), 544);
         assert_eq!(BTreeNode::parse(&enc, sizes, 0).unwrap(), node);
         assert!(node.encode_group(sizes, 0).is_err());
+    }
+}
+
+#[cfg(test)]
+mod encode_tests {
+    use super::super::chunk_index::encode_testutil::{apply, bump};
+    use super::*;
+
+    fn entries(n: u64) -> Vec<ChunkEntry> {
+        // 2-D grid of 2x3 chunks, 9 chunks per row.
+        (0..n)
+            .map(|i| ChunkEntry {
+                offsets: vec![(i / 9) * 2, (i % 9) * 3],
+                size: 24 + (i % 5) as u32,
+                filter_mask: (i % 2) as u32,
+                address: 10_000 + i * 32,
+            })
+            .collect()
+    }
+
+    fn round_trip(sizes: Sizes, n: u64) -> Vec<u8> {
+        let e = entries(n);
+        let last = &e[e.len() - 1].offsets;
+        let end = ChunkKey {
+            size: 0,
+            filter_mask: 0,
+            offsets: vec![last[0] + 2, last[1]],
+        };
+        let mut alloc = bump(64);
+        let idx = encode_chunk_btree(sizes, 32, &e, &end, 4, &mut alloc).unwrap();
+        let mut f = vec![0u8; 64];
+        apply(&idx, &mut f);
+        assert_eq!(chunk_btree_entries(&f, idx.address, sizes, 2).unwrap(), e);
+        for x in e.iter().step_by(11) {
+            let found = find_chunk(&f, idx.address, sizes, &[2, 3], &x.offsets)
+                .unwrap()
+                .unwrap();
+            assert_eq!(&found, x);
+        }
+        // A chunk that does not exist.
+        let missing = vec![(n / 9 + 5) * 2, 0];
+        assert!(
+            find_chunk(&f, idx.address, sizes, &[2, 3], &missing)
+                .unwrap()
+                .is_none()
+        );
+        f
+    }
+
+    #[test]
+    fn single_and_multi_level() {
+        round_trip(Sizes::DEFAULT, 1);
+        round_trip(Sizes::DEFAULT, 64);
+        round_trip(Sizes::DEFAULT, 65);
+        round_trip(Sizes::DEFAULT, 5000);
+        round_trip(
+            Sizes {
+                offset: 4,
+                length: 4,
+            },
+            300,
+        );
+    }
+
+    #[test]
+    fn node_layout() {
+        let f = round_trip(Sizes::DEFAULT, 3);
+        let node = BTreeNode::parse(&f[64..], Sizes::DEFAULT, 2).unwrap();
+        assert_eq!(node.level, 0);
+        assert_eq!(node.children.len(), 3);
+        assert_eq!(node.left_sibling, UNDEFINED_ADDRESS);
+        // Full-size node for K = 32.
+        assert_eq!(
+            BTreeNode::chunk_node_size(Sizes::DEFAULT, 32, 2),
+            24 + 65 * 32 + 64 * 8
+        );
     }
 }

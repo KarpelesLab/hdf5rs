@@ -1,6 +1,6 @@
 //! Output storage and space allocation for the writer.
 
-use std::io::{Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 
 use crate::error::{Error, Result};
 use crate::format::Sizes;
@@ -19,6 +19,21 @@ pub trait WriteAt {
     /// (the end-of-file address). Implementations should make the output
     /// exactly `len` bytes long when they can and flush buffers.
     fn finish(&mut self, len: u64) -> Result<()>;
+
+    /// Whether [`read_exact_at`](Self::read_exact_at) works. Storage that
+    /// can read back lets the writer evict partially written chunks from
+    /// memory and rewrite stored chunks; without it they stay in memory
+    /// until the file is finished. Defaults to `false`.
+    fn supports_read_back(&self) -> bool {
+        false
+    }
+
+    /// Read exactly `buf.len()` previously written bytes at `pos`. The
+    /// default implementation reports [`Error::Unsupported`].
+    fn read_exact_at(&mut self, pos: u64, buf: &mut [u8]) -> Result<()> {
+        let _ = (pos, buf);
+        Err(Error::unsupported("reading back from this storage"))
+    }
 }
 
 impl WriteAt for Vec<u8> {
@@ -40,6 +55,20 @@ impl WriteAt for Vec<u8> {
         self.resize(len, 0);
         Ok(())
     }
+
+    fn supports_read_back(&self) -> bool {
+        true
+    }
+
+    fn read_exact_at(&mut self, pos: u64, buf: &mut [u8]) -> Result<()> {
+        let src = usize::try_from(pos)
+            .ok()
+            .and_then(|p| Some(p..p.checked_add(buf.len())?))
+            .and_then(|r| self.get(r))
+            .ok_or(Error::UnexpectedEof)?;
+        buf.copy_from_slice(src);
+        Ok(())
+    }
 }
 
 impl WriteAt for std::fs::File {
@@ -52,6 +81,16 @@ impl WriteAt for std::fs::File {
     fn finish(&mut self, len: u64) -> Result<()> {
         self.set_len(len)?;
         self.flush()?;
+        Ok(())
+    }
+
+    fn supports_read_back(&self) -> bool {
+        true
+    }
+
+    fn read_exact_at(&mut self, pos: u64, buf: &mut [u8]) -> Result<()> {
+        self.seek(SeekFrom::Start(pos))?;
+        self.read_exact(buf)?;
         Ok(())
     }
 }

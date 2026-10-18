@@ -69,6 +69,7 @@ use std::sync::OnceLock;
 
 pub use chunked::ChunkInfo;
 pub use selection::{HyperslabDim, Selection};
+pub(crate) use selection::{Resolved, block_runs, for_each_run, row_major_strides};
 pub(crate) use virtual_layout::read_virtual;
 
 use crate::error::{Error, Result};

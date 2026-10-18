@@ -1066,6 +1066,147 @@ pub fn encode_node(
     Ok(w.into_vec())
 }
 
+/// Bulk-load a complete v2 B-tree from `records`, which must be sorted in
+/// the tree's key order.
+///
+/// `template` supplies the tree type, node size, record size and split /
+/// merge percentages; depth, root and counts are computed. The tree has the
+/// smallest possible depth and records are spread evenly over the nodes of
+/// each level (every internal node has at least two children). Space is
+/// reserved through `alloc`: the header first, then the nodes bottom-up.
+/// An empty tree is a header with an undefined root address.
+pub fn encode_btree_v2(
+    template: &BTreeV2Header,
+    sizes: Sizes,
+    records: &[Record],
+    chunk_size_len: usize,
+    alloc: &mut super::chunk_index::AllocFn<'_>,
+) -> Result<super::chunk_index::EncodedIndex> {
+    use super::chunk_index::{EncodedBlock, EncodedIndex};
+    let n = records.len() as u64;
+    let mut header = BTreeV2Header {
+        depth: 0,
+        root_address: UNDEFINED_ADDRESS,
+        root_num_records: 0,
+        total_records: n,
+        ..*template
+    };
+    // Subtree capacities per depth, until they cover every record.
+    let mut caps = vec![header.node_capacity(sizes, 0)?.0];
+    if caps[0] < 3 {
+        return Err(Error::invalid("v2 B-tree node too small for bulk loading"));
+    }
+    while caps.last().copied().unwrap_or(0) < n {
+        let d = u16::try_from(caps.len()).map_err(|_| Error::LimitExceeded("v2 B-tree depth"))?;
+        let (imax, _, _) = header.node_capacity(sizes, d)?;
+        let below = caps.last().copied().unwrap_or(0);
+        caps.push(
+            imax.checked_add(1)
+                .and_then(|c| c.checked_mul(below))
+                .and_then(|c| c.checked_add(imax))
+                .unwrap_or(u64::MAX),
+        );
+    }
+    header.depth =
+        u16::try_from(caps.len() - 1).map_err(|_| Error::LimitExceeded("v2 B-tree depth"))?;
+    let address = alloc(BTreeV2Header::encoded_size(sizes) as u64)?;
+    let mut blocks = Vec::new();
+
+    struct Ctx<'a, 'b> {
+        header: &'a BTreeV2Header,
+        sizes: Sizes,
+        caps: &'a [u64],
+        chunk_size_len: usize,
+        alloc: &'a mut super::chunk_index::AllocFn<'b>,
+        blocks: &'a mut Vec<EncodedBlock>,
+    }
+
+    fn build(cx: &mut Ctx<'_, '_>, recs: &[Record], depth: u16) -> Result<ChildPointer> {
+        let len = recs.len();
+        let (bytes, own, total) = if depth == 0 {
+            let b = encode_node(cx.header, cx.sizes, 0, recs, &[], cx.chunk_size_len)?;
+            (b, len as u64, len as u64)
+        } else {
+            let below = cx
+                .caps
+                .get(usize::from(depth) - 1)
+                .copied()
+                .ok_or_else(|| Error::invalid("v2 B-tree depth"))?;
+            let per = below.saturating_add(1);
+            let c = usize::try_from((len as u64 + 1).div_ceil(per))
+                .map_err(|_| Error::LimitExceeded("v2 B-tree fan-out"))?
+                .max(2);
+            if len < 2 * c - 1 {
+                return Err(Error::invalid("v2 B-tree bulk load: too few records"));
+            }
+            let in_children = len - (c - 1);
+            let (base, extra) = (in_children / c, in_children % c);
+            let mut children = Vec::with_capacity(c);
+            let mut seps = Vec::with_capacity(c - 1);
+            let mut pos = 0usize;
+            let mut total = 0u64;
+            for i in 0..c {
+                let take = base + usize::from(i < extra);
+                let part = recs
+                    .get(pos..pos + take)
+                    .ok_or_else(|| Error::invalid("v2 B-tree bulk load range"))?;
+                let child = build(cx, part, depth - 1)?;
+                total += child.total_records;
+                children.push(child);
+                pos += take;
+                if i + 1 < c {
+                    seps.push(
+                        recs.get(pos)
+                            .cloned()
+                            .ok_or_else(|| Error::invalid("v2 B-tree bulk load range"))?,
+                    );
+                    pos += 1;
+                    total += 1;
+                }
+            }
+            let b = encode_node(
+                cx.header,
+                cx.sizes,
+                depth,
+                &seps,
+                &children,
+                cx.chunk_size_len,
+            )?;
+            (b, (c - 1) as u64, total)
+        };
+        let addr = (cx.alloc)(u64::from(cx.header.node_size))?;
+        cx.blocks.push(EncodedBlock {
+            address: addr,
+            bytes,
+        });
+        Ok(ChildPointer {
+            address: addr,
+            num_records: own,
+            total_records: total,
+        })
+    }
+
+    if n > 0 {
+        let mut cx = Ctx {
+            header: &header,
+            sizes,
+            caps: &caps,
+            chunk_size_len,
+            alloc,
+            blocks: &mut blocks,
+        };
+        let root = build(&mut cx, records, header.depth)?;
+        header.root_address = root.address;
+        header.root_num_records = u16::try_from(root.num_records)
+            .map_err(|_| Error::LimitExceeded("v2 B-tree root records"))?;
+    }
+    blocks.push(EncodedBlock {
+        address,
+        bytes: header.encode(sizes)?,
+    });
+    Ok(EncodedIndex { address, blocks })
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -1836,5 +1977,89 @@ pub(crate) mod tests {
             let mut w = ByteWriter::with_sizes(sizes);
             assert!(r.encode(&mut w, size - 1, ctx.chunk_size_len).is_err());
         }
+    }
+}
+
+#[cfg(test)]
+mod encode_tests {
+    use super::super::chunk_index::encode_testutil::{apply, bump};
+    use super::*;
+
+    fn chunk_records(n: u64, filtered: bool) -> Vec<Record> {
+        (0..n)
+            .map(|i| {
+                let scaled_offsets = vec![i / 7, i % 7];
+                if filtered {
+                    Record::FilteredChunk {
+                        address: 5000 + i,
+                        chunk_size: i % 1000,
+                        filter_mask: (i % 2) as u32,
+                        scaled_offsets,
+                    }
+                } else {
+                    Record::Chunk {
+                        address: 5000 + i,
+                        scaled_offsets,
+                    }
+                }
+            })
+            .collect()
+    }
+
+    fn round_trip(node_size: u32, n: u64, filtered: bool) -> BTreeV2Header {
+        let sizes = Sizes::DEFAULT;
+        let width = 2usize;
+        let record_size = 8 + if filtered { width + 4 } else { 0 } + 16;
+        let template = BTreeV2Header {
+            tree_type: if filtered { 11 } else { 10 },
+            node_size,
+            record_size: record_size as u16,
+            depth: 0,
+            split_percent: 100,
+            merge_percent: 40,
+            root_address: UNDEFINED_ADDRESS,
+            root_num_records: 0,
+            total_records: 0,
+        };
+        let recs = chunk_records(n, filtered);
+        let mut alloc = bump(64);
+        let idx = encode_btree_v2(&template, sizes, &recs, width, &mut alloc).unwrap();
+        let mut f = vec![0u8; 64];
+        apply(&idx, &mut f);
+        let ctx = RecordContext {
+            heap_id_len: None,
+            chunk_ndims: 2,
+            chunk_size_len: if filtered { width } else { 0 },
+        };
+        let tree = BTreeV2::open(&f, idx.address, sizes, ctx).unwrap();
+        assert_eq!(tree.records(&f).unwrap(), recs);
+        let key = |r: &Record| match r {
+            Record::Chunk { scaled_offsets, .. } | Record::FilteredChunk { scaled_offsets, .. } => {
+                scaled_offsets.clone()
+            }
+            _ => Vec::new(),
+        };
+        for target in recs.iter().step_by(13) {
+            let k = key(target);
+            let found = tree
+                .find(&f, |r| key(r).cmp(&k))
+                .unwrap()
+                .expect("record found");
+            assert_eq!(&found, target);
+        }
+        let buf = &f[idx.address as usize..];
+        BTreeV2Header::parse(buf, sizes).unwrap()
+    }
+
+    #[test]
+    fn depths() {
+        assert_eq!(round_trip(2048, 0, false).depth, 0);
+        assert_eq!(round_trip(2048, 5, false).depth, 0);
+        assert_eq!(round_trip(2048, 300, false).depth, 1);
+        assert_eq!(round_trip(512, 3000, false).depth, 2);
+        assert_eq!(round_trip(512, 2000, true).depth, 2);
+        let h = round_trip(256, 4000, true);
+        assert!(h.depth >= 3);
+        assert_eq!(h.total_records, 4000);
     }
 }

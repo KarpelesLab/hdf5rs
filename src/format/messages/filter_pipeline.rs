@@ -92,6 +92,60 @@ impl FilterPipeline {
         }
         Ok(FilterPipeline { filters })
     }
+
+    /// Encode the message body as version 1 or 2.
+    ///
+    /// Version 1 stores every filter's name (when present), NUL-terminated
+    /// and padded to a multiple of eight bytes, and pads odd client data
+    /// counts; version 2 stores names only for filter IDs of 256 and above,
+    /// without padding.
+    pub fn encode(&self, version: u8) -> Result<Vec<u8>> {
+        if !(1..=2).contains(&version) {
+            return Err(Error::unsupported(format!(
+                "encoding filter pipeline version {version}"
+            )));
+        }
+        if self.filters.len() > MAX_FILTERS {
+            return Err(Error::invalid("more than 32 filters in pipeline"));
+        }
+        let mut w = crate::format::ByteWriter::new();
+        w.u8(version).u8(self.filters.len() as u8);
+        if version == 1 {
+            w.zeros(6);
+        }
+        for f in &self.filters {
+            let nvalues = u16::try_from(f.client_data.len())
+                .map_err(|_| Error::LimitExceeded("filter client data"))?;
+            let name: Vec<u8> = match &f.name {
+                Some(n) if version == 1 || f.id >= 256 => {
+                    if n.contains('\0') {
+                        return Err(Error::invalid("filter name contains NUL"));
+                    }
+                    let mut b = n.as_bytes().to_vec();
+                    b.push(0);
+                    if version == 1 {
+                        b.resize(b.len().next_multiple_of(8), 0);
+                    }
+                    b
+                }
+                _ => Vec::new(),
+            };
+            let name_len =
+                u16::try_from(name.len()).map_err(|_| Error::LimitExceeded("filter name"))?;
+            w.u16(f.id);
+            if version == 1 || f.id >= 256 {
+                w.u16(name_len);
+            }
+            w.u16(u16::from(f.optional)).u16(nvalues).bytes(&name);
+            for &v in &f.client_data {
+                w.u32(v);
+            }
+            if version == 1 && nvalues % 2 == 1 {
+                w.zeros(4);
+            }
+        }
+        Ok(w.into_vec())
+    }
 }
 
 #[cfg(test)]
@@ -196,5 +250,78 @@ mod tests {
             m.truncate((rnd() % (m.len() as u64 + 1)) as usize);
             let _ = FilterPipeline::parse(&m, S);
         }
+    }
+}
+
+#[cfg(test)]
+mod encode_tests {
+    use super::*;
+
+    fn sample() -> FilterPipeline {
+        FilterPipeline {
+            filters: vec![
+                FilterInfo {
+                    id: FILTER_SHUFFLE,
+                    name: Some("shuffle".into()),
+                    optional: true,
+                    client_data: vec![4],
+                },
+                FilterInfo {
+                    id: FILTER_DEFLATE,
+                    name: Some("deflate".into()),
+                    optional: true,
+                    client_data: vec![4],
+                },
+                FilterInfo {
+                    id: FILTER_FLETCHER32,
+                    name: Some("fletcher32".into()),
+                    optional: false,
+                    client_data: vec![],
+                },
+                FilterInfo {
+                    id: 32000,
+                    name: Some("lzf".into()),
+                    optional: true,
+                    client_data: vec![4, 261, 40],
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn matches_reference_bytes() {
+        // Bytes as written by the reference library (v2: names only for
+        // IDs >= 256; v1: names padded to 8 bytes).
+        let p = FilterPipeline {
+            filters: sample().filters[3..].to_vec(),
+        };
+        let mut v2 = vec![2, 1, 0, 0x7d, 4, 0, 1, 0, 3, 0];
+        v2.extend_from_slice(b"lzf\0");
+        v2.extend_from_slice(&[4, 0, 0, 0, 5, 1, 0, 0, 40, 0, 0, 0]);
+        assert_eq!(p.encode(2).unwrap(), v2);
+        let p = FilterPipeline {
+            filters: sample().filters[1..2].to_vec(),
+        };
+        let mut v1 = vec![1, 1, 0, 0, 0, 0, 0, 0, 1, 0, 8, 0, 1, 0, 1, 0];
+        v1.extend_from_slice(b"deflate\0");
+        v1.extend_from_slice(&[4, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(p.encode(1).unwrap(), v1);
+    }
+
+    #[test]
+    fn round_trip() {
+        let p = sample();
+        for v in [1, 2] {
+            let mut got = FilterPipeline::parse(&p.encode(v).unwrap(), Sizes::DEFAULT).unwrap();
+            if v == 2 {
+                for (g, e) in got.filters.iter_mut().zip(&p.filters) {
+                    if e.id < 256 {
+                        g.name = e.name.clone();
+                    }
+                }
+            }
+            assert_eq!(got, p);
+        }
+        assert!(p.encode(3).is_err());
     }
 }

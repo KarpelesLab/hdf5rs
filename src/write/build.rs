@@ -3,7 +3,9 @@
 
 use super::compat::{self, EntryTarget, SymTabPlan};
 use super::dense::{DenseKind, DensePlan};
-use super::{AttrSpec, FileWriter, LayoutSpec, LinkTargetSpec, Node, NodeKind, Patched, WriteAt};
+use super::{
+    AttrSpec, DatasetSpec, FileWriter, LayoutSpec, LinkTargetSpec, Node, NodeKind, Patched, WriteAt,
+};
 use crate::error::{Error, Result};
 use crate::format::messages::MessageType;
 use crate::format::messages::attribute::{Attribute, MaybeShared};
@@ -105,6 +107,46 @@ fn raw(msg_type: u16, flags: u8, data: Vec<u8>) -> RawMessage {
         creation_order: None,
         data,
     }
+}
+
+/// The filter pipeline (chunked datasets with filters; message version
+/// `pipeline_version`) and data layout messages of a dataset.
+fn storage_messages(
+    cx: &Ctx<'_>,
+    d: &DatasetSpec,
+    pipeline_version: u8,
+) -> Result<Vec<RawMessage>> {
+    let sizes = cx.sizes;
+    let mut msgs = Vec::new();
+    let (layout, version) = match &d.layout {
+        LayoutSpec::Compact(p) => (
+            DataLayout::Compact {
+                data: patched(p, cx.addrs, sizes)?,
+                dims: None,
+            },
+            3,
+        ),
+        LayoutSpec::Contiguous { address, size } => (
+            DataLayout::Contiguous {
+                address: *address,
+                size: Some(*size),
+                dims: None,
+            },
+            3,
+        ),
+        LayoutSpec::Chunked(c) => {
+            if !c.pipeline.filters.is_empty() {
+                msgs.push(raw(
+                    MessageType::FILTER_PIPELINE,
+                    0,
+                    c.pipeline.encode(pipeline_version)?,
+                ));
+            }
+            (c.layout(d.datatype.size), c.layout_version())
+        }
+    };
+    msgs.push(raw(MessageType::LAYOUT, 0, layout.encode(version, sizes)?));
+    Ok(msgs)
 }
 
 struct Ctx<'a> {
@@ -272,18 +314,7 @@ fn encode_node(
                 RawMessage::FLAG_CONSTANT,
                 d.fill.encode()?,
             ));
-            let layout = match &d.layout {
-                LayoutSpec::Compact(p) => DataLayout::Compact {
-                    data: patched(p, cx.addrs, sizes)?,
-                    dims: None,
-                },
-                LayoutSpec::Contiguous { address, size } => DataLayout::Contiguous {
-                    address: *address,
-                    size: Some(*size),
-                    dims: None,
-                },
-            };
-            msgs.push(raw(MessageType::LAYOUT, 0, layout.encode(3, sizes)?));
+            msgs.extend(storage_messages(cx, d, 2)?);
             if !node.attrs.is_empty() {
                 msgs.push(attribute_info(dense_attrs)?);
             }
@@ -370,18 +401,7 @@ fn encode_node_v1(cx: &Ctx<'_>, id: usize, symtab: Option<(u64, u64)>) -> Result
                 RawMessage::FLAG_CONSTANT,
                 fill.encode()?,
             ));
-            let layout = match &d.layout {
-                LayoutSpec::Compact(p) => DataLayout::Compact {
-                    data: patched(p, cx.addrs, sizes)?,
-                    dims: None,
-                },
-                LayoutSpec::Contiguous { address, size } => DataLayout::Contiguous {
-                    address: *address,
-                    size: Some(*size),
-                    dims: None,
-                },
-            };
-            msgs.push(raw(MessageType::LAYOUT, 0, layout.encode(3, sizes)?));
+            msgs.extend(storage_messages(cx, d, 1)?);
         }
         NodeKind::NamedDatatype(dt) => {
             msgs.push(raw(

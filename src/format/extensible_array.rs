@@ -673,6 +673,289 @@ impl ExtensibleArray {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Encoding (write side)
+// ---------------------------------------------------------------------------
+
+impl ExtensibleArrayHeader {
+    /// Encode the header (`EAHD` through checksum).
+    pub fn encode(&self, sizes: Sizes) -> Result<Vec<u8>> {
+        let mut w = super::ByteWriter::with_sizes(sizes);
+        w.bytes(b"EAHD")
+            .u8(0)
+            .u8(self.client_id)
+            .u8(self.element_size)
+            .u8(self.max_nelmts_bits)
+            .u8(self.index_block_elements)
+            .u8(self.data_block_min_elements)
+            .u8(self.secondary_block_min_data_ptrs)
+            .u8(self.max_data_block_page_elements_bits);
+        for v in [
+            self.num_secondary_blocks,
+            self.secondary_block_size,
+            self.num_data_blocks,
+            self.data_block_size,
+            self.max_index_set,
+            self.num_elements,
+        ] {
+            w.write_length(v)?;
+        }
+        w.write_offset(self.index_block_address)?;
+        Ok(super::chunk_index::seal_block(w))
+    }
+}
+
+/// Creation parameters of an extensible array (as stored in the layout
+/// message).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExtensibleArrayParams {
+    /// Bits needed to store the maximum number of elements.
+    pub max_nelmts_bits: u8,
+    /// Elements stored in the index block.
+    pub index_block_elements: u8,
+    /// Minimum data block pointers of a secondary block (power of two).
+    pub secondary_block_min_data_ptrs: u8,
+    /// Minimum elements per data block (power of two).
+    pub data_block_min_elements: u8,
+    /// log2 of the maximum number of elements in a data block page.
+    pub max_data_block_page_elements_bits: u8,
+}
+
+impl Default for ExtensibleArrayParams {
+    /// The parameters the reference library uses for chunk indexes.
+    fn default() -> Self {
+        ExtensibleArrayParams {
+            max_nelmts_bits: 32,
+            index_block_elements: 4,
+            secondary_block_min_data_ptrs: 4,
+            data_block_min_elements: 16,
+            max_data_block_page_elements_bits: 10,
+        }
+    }
+}
+
+/// Encode an Extensible Array chunk index holding `records` (array indices
+/// `0..records.len()`; "max index set" is `records.len()`).
+///
+/// Data blocks are created only when they hold an allocated record, and
+/// secondary blocks only when one of their data blocks exists, as the
+/// reference library does when elements are set. Paged data blocks are
+/// written in full, with the bitmap bit of every page holding an allocated
+/// record set.
+///
+/// "Block Offset" fields follow what the reference library writes: the
+/// super block's first element index (index block elements excluded) plus
+/// the data block's position in its parent's address list times the data
+/// block size; for data blocks listed in the index block that position
+/// counts every index block data block before it.
+pub fn encode_extensible_array(
+    ctx: &ChunkIndexContext,
+    size_width: u8,
+    params: &ExtensibleArrayParams,
+    records: &[ChunkRecord],
+    alloc: &mut super::chunk_index::AllocFn<'_>,
+) -> Result<super::chunk_index::EncodedIndex> {
+    use super::chunk_index::{EncodedBlock, EncodedIndex, seal_block, set_bitmap_bit};
+    let sizes = ctx.sizes;
+    let codec = ElementCodec::for_encoding(sizes, ctx.filtered, size_width)?;
+    let mut header = ExtensibleArrayHeader {
+        address: 0,
+        client_id: u8::from(ctx.filtered),
+        element_size: u8::try_from(codec.element_size)
+            .map_err(|_| Error::invalid("extensible array element size"))?,
+        max_nelmts_bits: params.max_nelmts_bits,
+        index_block_elements: params.index_block_elements,
+        data_block_min_elements: params.data_block_min_elements,
+        secondary_block_min_data_ptrs: params.secondary_block_min_data_ptrs,
+        max_data_block_page_elements_bits: params.max_data_block_page_elements_bits,
+        num_secondary_blocks: 0,
+        secondary_block_size: 0,
+        num_data_blocks: 0,
+        data_block_size: 0,
+        max_index_set: records.len() as u64,
+        num_elements: u64::from(params.index_block_elements),
+        index_block_address: UNDEFINED_ADDRESS,
+    };
+    let g = ExtensibleArrayGeometry::from_header(&header)?;
+    let n = records.len() as u64;
+    if g.max_nelmts_bits < 64 && n > (1u64 << g.max_nelmts_bits) {
+        return Err(Error::LimitExceeded("too many extensible array elements"));
+    }
+    header.address = alloc(ExtensibleArrayHeader::encoded_size(sizes) as u64)?;
+    let o = usize::from(sizes.offset);
+    let nel = g.index_block_elements as usize;
+    let ndb = g.index_block_data_block_addresses() as usize;
+    let nsb = g.index_block_secondary_block_addresses() as usize;
+    let iblock_len = prefix_len(sizes) + nel * codec.element_size + (ndb + nsb) * o + 4;
+    header.index_block_address = alloc(iblock_len as u64)?;
+    let rec_at = |i: u64| -> ChunkRecord {
+        usize::try_from(i)
+            .ok()
+            .and_then(|i| records.get(i).copied())
+            .unwrap_or(ChunkRecord::UNALLOCATED)
+    };
+    let any_allocated = |start: u64, len: u64| -> bool {
+        let end = start.saturating_add(len).min(n);
+        (start..end).any(|i| rec_at(i).is_allocated())
+    };
+    let prefix = |w: &mut super::ByteWriter, sig: &[u8; 4]| -> Result<()> {
+        w.bytes(sig).u8(0).u8(header.client_id);
+        w.write_offset(header.address)?;
+        Ok(())
+    };
+    let bow = g.block_offset_width();
+    // Encode one data block of super block `s` starting at array index
+    // `start` (`per` elements); returns its bytes and page bitmap bits.
+    let data_block =
+        |s: u32, start: u64, per: u64, block_offset: u64| -> Result<(Vec<u8>, Vec<bool>)> {
+            let mut w = super::ByteWriter::with_sizes(sizes);
+            prefix(&mut w, b"EADB")?;
+            w.write_uint(block_offset, bow)?;
+            match g.data_block_paging(s)? {
+                None => {
+                    for i in start..start + per {
+                        codec.encode(&mut w, &rec_at(i))?;
+                    }
+                    Ok((seal_block(w), Vec::new()))
+                }
+                Some((pe, npages)) => {
+                    let mut bytes = seal_block(w);
+                    let mut bits = Vec::new();
+                    for p in 0..npages {
+                        let pstart = start + p * pe;
+                        bits.push(any_allocated(pstart, pe));
+                        let mut pw = super::ByteWriter::with_sizes(sizes);
+                        for i in pstart..pstart + pe {
+                            codec.encode(&mut pw, &rec_at(i))?;
+                        }
+                        bytes.extend_from_slice(&seal_block(pw));
+                    }
+                    Ok((bytes, bits))
+                }
+            }
+        };
+
+    let mut blocks = Vec::new();
+    let mut iblock_dblks = vec![UNDEFINED_ADDRESS; ndb];
+    let mut iblock_sblks = vec![UNDEFINED_ADDRESS; nsb];
+    let mut iblock_pos = 0usize;
+    let iblock_sblk_count = g.index_block_super_blocks();
+    for s in 0..g.super_block_count() {
+        let start = g.super_block_start(s)?;
+        if start >= n {
+            break;
+        }
+        let rel = start - g.index_block_elements;
+        let ndblks = g.data_blocks_in_super_block(s)?;
+        let per = g.data_block_elements(s)?;
+        if s < iblock_sblk_count {
+            for d in 0..ndblks {
+                let dstart = start + d * per;
+                let pos = iblock_pos;
+                iblock_pos += 1;
+                if !any_allocated(dstart, per) {
+                    continue;
+                }
+                let off = rel + pos as u64 * per;
+                let (bytes, _) = data_block(s, dstart, per, off)?;
+                let addr = alloc(bytes.len() as u64)?;
+                header.num_data_blocks += 1;
+                header.data_block_size += bytes.len() as u64;
+                header.num_elements += per;
+                if let Some(slot) = iblock_dblks.get_mut(pos) {
+                    *slot = addr;
+                }
+                blocks.push(EncodedBlock {
+                    address: addr,
+                    bytes,
+                });
+            }
+            continue;
+        }
+        // Super block with a secondary block.
+        if !any_allocated(start, ndblks.saturating_mul(per)) {
+            continue;
+        }
+        let npages = g.data_block_paging(s)?.map_or(0, |(_, np)| np);
+        let nbits = ndblks
+            .checked_mul(npages)
+            .ok_or(Error::LimitExceeded("extensible array page bitmap"))?;
+        let mut bitmap = vec![
+            0u8;
+            usize::try_from(nbits.div_ceil(8)).map_err(|_| {
+                Error::LimitExceeded("extensible array page bitmap")
+            })?
+        ];
+        let mut dblk_addrs = Vec::new();
+        for d in 0..ndblks {
+            let dstart = start + d * per;
+            if !any_allocated(dstart, per) {
+                dblk_addrs.push(UNDEFINED_ADDRESS);
+                continue;
+            }
+            let (bytes, bits) = data_block(s, dstart, per, rel + d * per)?;
+            for (p, set) in bits.into_iter().enumerate() {
+                if set {
+                    set_bitmap_bit(&mut bitmap, d * npages + p as u64);
+                }
+            }
+            let addr = alloc(bytes.len() as u64)?;
+            header.num_data_blocks += 1;
+            header.data_block_size += bytes.len() as u64;
+            header.num_elements += per;
+            dblk_addrs.push(addr);
+            blocks.push(EncodedBlock {
+                address: addr,
+                bytes,
+            });
+        }
+        let mut w = super::ByteWriter::with_sizes(sizes);
+        prefix(&mut w, b"EASB")?;
+        w.write_uint(rel, bow)?;
+        w.bytes(&bitmap);
+        for a in &dblk_addrs {
+            w.write_offset(*a)?;
+        }
+        let bytes = seal_block(w);
+        let addr = alloc(bytes.len() as u64)?;
+        header.num_secondary_blocks += 1;
+        header.secondary_block_size += bytes.len() as u64;
+        let slot = (s - iblock_sblk_count) as usize;
+        *iblock_sblks
+            .get_mut(slot)
+            .ok_or_else(|| Error::invalid("extensible array secondary block slot"))? = addr;
+        blocks.push(EncodedBlock {
+            address: addr,
+            bytes,
+        });
+    }
+    // Index block.
+    let mut w = super::ByteWriter::with_sizes(sizes);
+    prefix(&mut w, b"EAIB")?;
+    for i in 0..g.index_block_elements {
+        codec.encode(&mut w, &rec_at(i))?;
+    }
+    for a in iblock_dblks.iter().chain(&iblock_sblks) {
+        w.write_offset(*a)?;
+    }
+    let bytes = seal_block(w);
+    if bytes.len() != iblock_len {
+        return Err(Error::invalid("extensible array index block size"));
+    }
+    blocks.push(EncodedBlock {
+        address: header.index_block_address,
+        bytes,
+    });
+    blocks.push(EncodedBlock {
+        address: header.address,
+        bytes: header.encode(sizes)?,
+    });
+    Ok(EncodedIndex {
+        address: header.address,
+        blocks,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::chunk_index::testutil::{Rng, put, put_addr, seal, set_bit};
@@ -1176,5 +1459,109 @@ mod tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod encode_tests {
+    use super::super::chunk_index::encode_testutil::{apply, bump};
+    use super::*;
+
+    fn records(n: u64, filtered: bool, hole: impl Fn(u64) -> bool) -> Vec<ChunkRecord> {
+        (0..n)
+            .map(|i| {
+                if hole(i) {
+                    ChunkRecord::UNALLOCATED
+                } else {
+                    ChunkRecord {
+                        address: 1_000_000 + i * 8,
+                        size: filtered.then_some(i % 300 + 1),
+                        filter_mask: if filtered { (i % 3) as u32 } else { 0 },
+                    }
+                }
+            })
+            .collect()
+    }
+
+    fn ctx(sizes: Sizes, filtered: bool) -> ChunkIndexContext {
+        if filtered {
+            ChunkIndexContext::filtered(sizes)
+        } else {
+            ChunkIndexContext::unfiltered(sizes)
+        }
+    }
+
+    fn round_trip(
+        sizes: Sizes,
+        filtered: bool,
+        params: &ExtensibleArrayParams,
+        recs: &[ChunkRecord],
+    ) -> (Vec<u8>, ExtensibleArray) {
+        let c = ctx(sizes, filtered);
+        let mut alloc = bump(64);
+        let idx = encode_extensible_array(&c, 3, params, recs, &mut alloc).unwrap();
+        let mut f = vec![0u8; 64];
+        apply(&idx, &mut f);
+        let ea = ExtensibleArray::open(&f, idx.address, &c).unwrap();
+        assert_eq!(ea.records(&f, recs.len() as u64).unwrap(), recs);
+        for (i, r) in recs.iter().enumerate().step_by(7) {
+            assert_eq!(ea.get(&f, i as u64).unwrap(), *r);
+        }
+        (f, ea)
+    }
+
+    #[test]
+    fn matches_reference_statistics() {
+        // 1500 chunks with the default parameters: statistics and block
+        // offsets as in a file written by the reference library.
+        let p = ExtensibleArrayParams::default();
+        let recs = records(1500, false, |_| false);
+        let (f, ea) = round_trip(Sizes::DEFAULT, false, &p, &recs);
+        let h = ea.header;
+        assert_eq!(h.num_secondary_blocks, 3);
+        assert_eq!(h.secondary_block_size, 194);
+        assert_eq!(h.num_data_blocks, 18);
+        assert_eq!(h.data_block_size, 12556);
+        assert_eq!(h.max_index_set, 1500);
+        assert_eq!(h.num_elements, 1524);
+        // Block offsets of the index block's data blocks.
+        let offs: Vec<u64> = ea
+            .data_block_addresses
+            .iter()
+            .map(|&a| {
+                let p = a as usize + prefix_len(Sizes::DEFAULT);
+                u64::from(u32::from_le_bytes(f[p..p + 4].try_into().unwrap()))
+            })
+            .collect();
+        assert_eq!(offs, [0, 48, 112, 144, 368, 432]);
+    }
+
+    #[test]
+    fn sparse_filtered_and_small_sizes() {
+        let p = ExtensibleArrayParams::default();
+        let recs = records(700, true, |i| i % 5 != 0 || (100..400).contains(&i));
+        round_trip(Sizes::DEFAULT, true, &p, &recs);
+        let s4 = Sizes {
+            offset: 4,
+            length: 4,
+        };
+        round_trip(s4, false, &p, &records(3, false, |_| false));
+        round_trip(s4, true, &p, &records(90, true, |i| i == 50));
+    }
+
+    #[test]
+    fn paged_data_blocks() {
+        // Tiny pages so that secondary-block data blocks are paged.
+        let p = ExtensibleArrayParams {
+            max_nelmts_bits: 16,
+            index_block_elements: 2,
+            secondary_block_min_data_ptrs: 2,
+            data_block_min_elements: 2,
+            max_data_block_page_elements_bits: 2,
+        };
+        let recs = records(300, false, |i| (40..90).contains(&i) || i % 11 == 3);
+        round_trip(Sizes::DEFAULT, false, &p, &recs);
+        let recs = records(150, true, |i| i < 60);
+        round_trip(Sizes::DEFAULT, true, &p, &recs);
     }
 }

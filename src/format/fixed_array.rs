@@ -202,6 +202,116 @@ impl FixedArray {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Encoding (write side)
+// ---------------------------------------------------------------------------
+
+impl FixedArrayHeader {
+    /// Encode the header (`FAHD` through checksum).
+    pub fn encode(&self, sizes: Sizes) -> Result<Vec<u8>> {
+        let mut w = super::ByteWriter::with_sizes(sizes);
+        w.bytes(b"FAHD")
+            .u8(0)
+            .u8(self.client_id)
+            .u8(self.entry_size)
+            .u8(self.page_bits);
+        w.write_length(self.max_num_entries)?;
+        w.write_offset(self.data_block_address)?;
+        Ok(super::chunk_index::seal_block(w))
+    }
+}
+
+/// Encode a Fixed Array chunk index holding `records` (one per chunk, in
+/// linear chunk index order; the array size is `records.len()`).
+///
+/// `size_width` is the width of the chunk size field of filtered elements
+/// (ignored when `ctx.filtered` is false). Space is reserved through
+/// `alloc`: first the header, then the data block (with its pages, as one
+/// region). Pages are written in full; a page's bitmap bit is set when it
+/// holds at least one allocated chunk.
+pub fn encode_fixed_array(
+    ctx: &ChunkIndexContext,
+    size_width: u8,
+    page_bits: u8,
+    records: &[ChunkRecord],
+    alloc: &mut super::chunk_index::AllocFn<'_>,
+) -> Result<super::chunk_index::EncodedIndex> {
+    use super::chunk_index::{EncodedBlock, EncodedIndex, seal_block, set_bitmap_bit};
+    let sizes = ctx.sizes;
+    let codec = ElementCodec::for_encoding(sizes, ctx.filtered, size_width)?;
+    let mut header = FixedArrayHeader {
+        address: 0,
+        client_id: u8::from(ctx.filtered),
+        entry_size: u8::try_from(codec.element_size)
+            .map_err(|_| Error::invalid("fixed array entry size"))?,
+        page_bits,
+        max_num_entries: records.len() as u64,
+        data_block_address: UNDEFINED_ADDRESS,
+    };
+    header.address = alloc(FixedArrayHeader::encoded_size(sizes) as u64)?;
+    let n = records.len();
+    let per_page = header
+        .page_entries()
+        .map(|p| usize::try_from(p).map_err(|_| Error::LimitExceeded("fixed array page size")))
+        .transpose()?;
+    let prefix = |w: &mut super::ByteWriter| -> Result<()> {
+        w.bytes(b"FADB").u8(0).u8(header.client_id);
+        w.write_offset(header.address)?;
+        Ok(())
+    };
+    let mut blocks = Vec::new();
+    match per_page {
+        None => {
+            let mut w = super::ByteWriter::with_sizes(sizes);
+            prefix(&mut w)?;
+            for r in records {
+                codec.encode(&mut w, r)?;
+            }
+            let bytes = seal_block(w);
+            header.data_block_address = alloc(bytes.len() as u64)?;
+            blocks.push(EncodedBlock {
+                address: header.data_block_address,
+                bytes,
+            });
+        }
+        Some(per_page) => {
+            let npages = n.div_ceil(per_page);
+            let mut bitmap = vec![0u8; npages.div_ceil(8)];
+            let mut pages = Vec::with_capacity(npages);
+            for (i, page) in records.chunks(per_page).enumerate() {
+                if page.iter().any(ChunkRecord::is_allocated) {
+                    set_bitmap_bit(&mut bitmap, i as u64);
+                }
+                let mut w = super::ByteWriter::with_sizes(sizes);
+                for r in page {
+                    codec.encode(&mut w, r)?;
+                }
+                pages.push(seal_block(w));
+            }
+            let mut w = super::ByteWriter::with_sizes(sizes);
+            prefix(&mut w)?;
+            w.bytes(&bitmap);
+            let mut bytes = seal_block(w);
+            for p in pages {
+                bytes.extend_from_slice(&p);
+            }
+            header.data_block_address = alloc(bytes.len() as u64)?;
+            blocks.push(EncodedBlock {
+                address: header.data_block_address,
+                bytes,
+            });
+        }
+    }
+    blocks.push(EncodedBlock {
+        address: header.address,
+        bytes: header.encode(sizes)?,
+    });
+    Ok(EncodedIndex {
+        address: header.address,
+        blocks,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::chunk_index::testutil::{Rng, put, put_addr, seal, set_bit};
@@ -456,5 +566,62 @@ mod tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod encode_tests {
+    use super::super::chunk_index::encode_testutil::{apply, bump};
+    use super::*;
+
+    fn records(n: u64, filtered: bool, hole: impl Fn(u64) -> bool) -> Vec<ChunkRecord> {
+        (0..n)
+            .map(|i| {
+                if hole(i) {
+                    ChunkRecord::UNALLOCATED
+                } else {
+                    ChunkRecord {
+                        address: 100_000 + i * 10,
+                        size: filtered.then_some(i + 3),
+                        filter_mask: if filtered { (i % 2) as u32 } else { 0 },
+                    }
+                }
+            })
+            .collect()
+    }
+
+    fn round_trip(sizes: Sizes, filtered: bool, width: u8, page_bits: u8, recs: &[ChunkRecord]) {
+        let ctx = if filtered {
+            ChunkIndexContext::filtered(sizes)
+        } else {
+            ChunkIndexContext::unfiltered(sizes)
+        };
+        let mut alloc = bump(64);
+        let idx = encode_fixed_array(&ctx, width, page_bits, recs, &mut alloc).unwrap();
+        let mut f = vec![0u8; 64];
+        apply(&idx, &mut f);
+        let got = FixedArray::read(&f, idx.address, &ctx).unwrap();
+        assert_eq!(got, recs);
+    }
+
+    #[test]
+    fn unpaged() {
+        let s = Sizes::DEFAULT;
+        round_trip(s, false, 0, 10, &records(7, false, |i| i == 3));
+        round_trip(s, true, 2, 10, &records(7, true, |i| i == 0));
+        let s4 = Sizes {
+            offset: 4,
+            length: 4,
+        };
+        round_trip(s4, true, 3, 10, &records(5, true, |_| false));
+    }
+
+    #[test]
+    fn paged() {
+        let s = Sizes::DEFAULT;
+        // 4 entries per page; page 1 entirely unallocated.
+        round_trip(s, false, 0, 2, &records(11, false, |i| (4..8).contains(&i)));
+        round_trip(s, true, 8, 2, &records(18, true, |i| i % 5 == 0));
+        round_trip(s, false, 0, 10, &records(2500, false, |i| i > 2100));
     }
 }
