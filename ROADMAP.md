@@ -139,13 +139,13 @@ Goal: create new files that the reference tools read without complaint.
 
 ## Milestone 5 — Write: chunking, compression, modification (`0.5`)
 
-- [ ] Chunked datasets with fixed-array, extensible-array, v2 B-tree and
+- [x] Chunked datasets with fixed-array, extensible-array, v2 B-tree and
       single-chunk indexes (and v1 B-tree in compat mode)
-- [ ] Resizable datasets (unlimited dimensions), append workflows
-- [ ] Filters on write: deflate, shuffle, Fletcher-32, LZF
+- [x] Resizable datasets (unlimited dimensions), append workflows
+- [x] Filters on write: deflate, shuffle, Fletcher-32, LZF
 - [ ] Open existing files read-write: add/delete objects and attributes,
       overwrite data in place, extend datasets
-- [ ] Partial (hyperslab) writes
+- [x] Partial (hyperslab) writes
 - [ ] Crash-consistency considerations; optional SWMR-compatible write order
       (documented, best effort)
 
