@@ -385,14 +385,24 @@ fn check_values(path: &str, dtype: &Json, obj: &Json, raw: &[u8]) -> bool {
     flatten(data, &mut vals);
     assert_eq!(vals.len() * size, raw.len(), "{path}: element count");
     let signed = dtype.get("signed") == Some(&Json::Bool(true));
+    // Integers with padding bits (e.g. N-bit data): only `precision` bits
+    // starting at `bit_offset` are significant.
+    let precision = dtype
+        .get("precision")
+        .and_then(Json::u64)
+        .map_or(size as u32 * 8, |p| p as u32);
+    let bit_offset = dtype.get("bit_offset").and_then(Json::u64).unwrap_or(0) as u32;
     for (i, (v, el)) in vals.iter().zip(le.chunks(size)).enumerate() {
         if class == "integer" {
             let mut buf = [0u8; 16];
             buf[..size].copy_from_slice(el);
-            if signed && el[size - 1] & 0x80 != 0 {
-                buf[size..].fill(0xff);
-            }
-            let got = i128::from_le_bytes(buf);
+            let raw = u128::from_le_bytes(buf) >> bit_offset;
+            let field = raw & (u128::MAX >> (128 - precision));
+            let got = if signed && precision < 128 && (field >> (precision - 1)) & 1 != 0 {
+                (field | (u128::MAX << precision)) as i128
+            } else {
+                field as i128
+            };
             let want: i128 = match v {
                 Json::Num(n) => n.parse().unwrap(),
                 Json::Bool(b) => *b as i128,
@@ -584,13 +594,22 @@ fn fixtures_read_raw() {
         eprintln!("  {u}");
     }
     assert!(checked > 60, "only {checked} datasets checked");
-    // Only filters we do not implement (and virtual datasets) may be
-    // unsupported.
+    // Only virtual datasets and filters whose Cargo feature is disabled may
+    // be unsupported; N-bit and scale-offset are always built in.
+    let optional_filters = [
+        (1, cfg!(feature = "deflate")),
+        (307, cfg!(feature = "bzip2")),
+        (32001, cfg!(feature = "blosc")),
+        (32004, cfg!(feature = "lz4")),
+        (32008, cfg!(feature = "bitshuffle")),
+        (32015, cfg!(feature = "zstd")),
+    ];
     for u in &unsupported {
-        assert!(
-            u.contains("filter id") || u.contains("virtual"),
-            "unexpected unsupported: {u}"
-        );
+        let allowed = u.contains("virtual")
+            || optional_filters
+                .iter()
+                .any(|(id, enabled)| !enabled && u.contains(&format!("filter id {id} ")));
+        assert!(allowed, "unexpected unsupported: {u}");
     }
 }
 

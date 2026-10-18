@@ -20,3 +20,16 @@ compcol = { version = "0.7.2", default-features = false, features = ["alloc", "z
 default = ["deflate"]
 # The deflate (gzip) filter, via the `compcol` crate.
 deflate = ["dep:compcol"]
+# Zstandard filter (id 32015), via `compcol`.
+zstd = ["dep:compcol", "compcol/zstd"]
+# LZ4 filter (id 32004), via `compcol`.
+lz4 = ["dep:compcol", "compcol/lz4"]
+# BZIP2 filter (id 307), via `compcol`.
+bzip2 = ["dep:compcol", "compcol/bzip2"]
+# Blosc filter (id 32001) with its lz4, zlib, zstd and snappy codecs (not
+# blosclz), via `compcol`.
+blosc = ["dep:compcol", "compcol/lz4", "compcol/zstd", "compcol/snappy"]
+# Bitshuffle filter (id 32008), optionally with lz4 or zstd, via `compcol`.
+bitshuffle = ["dep:compcol", "compcol/lz4", "compcol/zstd"]
+# Every optional filter.
+all-filters = ["deflate", "zstd", "lz4", "bzip2", "blosc", "bitshuffle"]

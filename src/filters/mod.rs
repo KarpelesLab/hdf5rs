@@ -14,18 +14,43 @@
 //! - a [`FilterRegistry`] mapping filter ids to implementations,
 //! - [`decode_pipeline`] / [`encode_pipeline`] which run a pipeline
 //!   description ([`PipelineStep`]s) over one chunk,
-//! - built-in codecs: `deflate` (feature `deflate`), [`shuffle`], [`fletcher32`], [`lzf`].
+//! - built-in codecs: `deflate` (feature `deflate`), [`shuffle`],
+//!   [`fletcher32`], [`lzf`], [`nbit`], [`scaleoffset`],
+//! - optional codecs backed by `compcol`, each behind its own Cargo feature
+//!   (all enabled by `all-filters`): `zstd`, `lz4`, `bzip2`, `blosc` and
+//!   `bitshuffle`.
 
 use std::collections::BTreeMap;
 use std::fmt;
 
 use crate::{Error, Result};
 
-#[cfg(feature = "deflate")]
+mod bits;
+#[cfg(any(feature = "bitshuffle", feature = "blosc"))]
+pub mod bitshuffle;
+#[cfg(feature = "blosc")]
+pub mod blosc;
+#[cfg(feature = "bzip2")]
+pub mod bzip2;
+#[cfg(any(
+    feature = "zstd",
+    feature = "lz4",
+    feature = "bzip2",
+    feature = "blosc",
+    feature = "bitshuffle"
+))]
+mod codec;
+#[cfg(any(feature = "deflate", feature = "blosc"))]
 pub mod deflate;
 pub mod fletcher32;
+#[cfg(feature = "lz4")]
+pub mod lz4;
 pub mod lzf;
+pub mod nbit;
+pub mod scaleoffset;
 pub mod shuffle;
+#[cfg(feature = "zstd")]
+pub mod zstd;
 
 /// Filter id: gzip / zlib deflate compression (spec-defined).
 pub const DEFLATE: u16 = 1;
@@ -35,9 +60,9 @@ pub const SHUFFLE: u16 = 2;
 pub const FLETCHER32: u16 = 3;
 /// Filter id: SZIP compression (spec-defined; not built in).
 pub const SZIP: u16 = 4;
-/// Filter id: N-bit packing (spec-defined; not built in).
+/// Filter id: N-bit packing (spec-defined).
 pub const NBIT: u16 = 5;
-/// Filter id: scale + offset (spec-defined; not built in).
+/// Filter id: scale + offset (spec-defined).
 pub const SCALEOFFSET: u16 = 6;
 /// Filter id: BZIP2 compression (registered third-party filter).
 pub const BZIP2: u16 = 307;
@@ -212,8 +237,10 @@ impl FilterRegistry {
         FilterRegistry::default()
     }
 
-    /// A registry with the built-in filters: deflate, shuffle, fletcher32
-    /// and lzf.
+    /// A registry with the built-in filters: deflate (feature `deflate`),
+    /// shuffle, fletcher32, N-bit, scale-offset and lzf, plus the optional
+    /// filters whose features are enabled: zstd, lz4, bzip2, blosc and
+    /// bitshuffle.
     pub fn with_builtin() -> Self {
         let mut r = FilterRegistry::new();
         #[cfg(feature = "deflate")]
@@ -221,6 +248,18 @@ impl FilterRegistry {
         r.register(Box::new(shuffle::Shuffle));
         r.register(Box::new(fletcher32::Fletcher32));
         r.register(Box::new(lzf::Lzf));
+        r.register(Box::new(nbit::NBit));
+        r.register(Box::new(scaleoffset::ScaleOffset));
+        #[cfg(feature = "zstd")]
+        r.register(Box::new(zstd::Zstd));
+        #[cfg(feature = "lz4")]
+        r.register(Box::new(lz4::Lz4));
+        #[cfg(feature = "bzip2")]
+        r.register(Box::new(bzip2::Bzip2));
+        #[cfg(feature = "blosc")]
+        r.register(Box::new(blosc::Blosc));
+        #[cfg(feature = "bitshuffle")]
+        r.register(Box::new(bitshuffle::Bitshuffle));
         r
     }
 
@@ -414,9 +453,21 @@ mod tests {
     #[test]
     fn registry_basics() {
         let r = FilterRegistry::with_builtin();
-        let mut expected = vec![SHUFFLE, FLETCHER32, LZF];
+        let mut expected = vec![SHUFFLE, FLETCHER32, NBIT, SCALEOFFSET];
         if cfg!(feature = "deflate") {
             expected.insert(0, DEFLATE);
+        }
+        for (id, on) in [
+            (BZIP2, cfg!(feature = "bzip2")),
+            (LZF, true),
+            (BLOSC, cfg!(feature = "blosc")),
+            (LZ4, cfg!(feature = "lz4")),
+            (BITSHUFFLE, cfg!(feature = "bitshuffle")),
+            (ZSTD, cfg!(feature = "zstd")),
+        ] {
+            if on {
+                expected.push(id);
+            }
         }
         assert_eq!(r.ids().collect::<Vec<_>>(), expected);
         assert_eq!(r.get(SHUFFLE).unwrap().name(), "shuffle");
@@ -559,6 +610,72 @@ mod tests {
         assert_eq!(mask, 0);
         assert!(enc.len() < data.len() / 4);
         assert_eq!(decode_pipeline(&r, &steps, mask, enc, &ctx).unwrap(), data);
+    }
+
+    #[test]
+    fn mutated_streams_never_panic() {
+        // Valid encodings from every built-in filter, then corrupted.
+        let r = FilterRegistry::with_builtin();
+        let data: Vec<u8> = (0..4000u32).flat_map(|i| (i / 5).to_le_bytes()).collect();
+        let n = (data.len() / 4) as u32;
+        let cds: Vec<(u16, Vec<u32>)> = vec![
+            (DEFLATE, vec![6]),
+            (SHUFFLE, vec![4]),
+            (FLETCHER32, vec![]),
+            (NBIT, vec![8, 0, n, 1, 4, 0, 20, 0]),
+            (SCALEOFFSET, {
+                let mut cd = vec![2, 0, n, 0, 4, 1, 0, 1];
+                cd.resize(20, 0);
+                cd
+            }),
+            (SCALEOFFSET, {
+                let mut cd = vec![0, 2, n / 2, 1, 8, 0, 0, 1];
+                cd.resize(20, 0);
+                cd
+            }),
+            (LZF, vec![]),
+            (ZSTD, vec![3]),
+            (LZ4, vec![1000]),
+            (BZIP2, vec![9]),
+            (BLOSC, vec![2, 2, 4, 0, 5, 1, 1]),
+            (BLOSC, vec![2, 2, 4, 0, 5, 2, 5]),
+            (BITSHUFFLE, vec![0, 4, 4, 0, 2]),
+            (BITSHUFFLE, vec![0, 4, 4, 64, 3, 3]),
+        ];
+        let mut x = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let ctx = FilterContext::new(4).with_max_output(1 << 20);
+        for (id, cd) in &cds {
+            let Some(f) = r.get(*id) else { continue };
+            let enc = f.encode(cd, data.clone(), &ctx).unwrap();
+            assert!(f.decode(cd, enc.clone(), &ctx).is_ok(), "{id}");
+            for _ in 0..300 {
+                let mut m = enc.clone();
+                match next() % 3 {
+                    0 => m.truncate((next() as usize) % (m.len() + 1)),
+                    1 => {
+                        for _ in 0..1 + next() % 4 {
+                            let i = (next() as usize) % m.len().max(1);
+                            if let Some(b) = m.get_mut(i) {
+                                *b ^= 1 << (next() % 8);
+                            }
+                        }
+                    }
+                    _ => {
+                        let i = (next() as usize) % m.len().max(1);
+                        if let Some(b) = m.get_mut(i) {
+                            *b = next() as u8;
+                        }
+                    }
+                }
+                let _ = f.decode(cd, m, &ctx);
+            }
+        }
     }
 
     #[test]

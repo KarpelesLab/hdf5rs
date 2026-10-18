@@ -27,7 +27,7 @@ The directory is excluded from the published crate.
 | `dtypes_latest.h5` | 3 | Every datatype class, latest format |
 | `filters.h5` | 3 | deflate levels 1/4/9, shuffle, shuffle+gzip, fletcher32, shuffle+gzip+fletcher32, lzf, scale-offset (int and float), N-bit (12-bit and 20-bit@offset 4), gzip on big-endian, random and vlen-string data |
 | `filters_earliest.h5` | 0 | gzip, shuffle+gzip+fletcher32, lzf with v1 B-tree chunk index |
-| `filters_plugins.h5` | 3 | Third-party filters (blosc/lz4, blosc/zstd, zstd, lz4, bzip2, bitshuffle) — expected to be *unsupported* by default |
+| `filters_plugins.h5` | 3 | Third-party filters (blosc/lz4, blosc/zstd, zstd, lz4, bzip2, bitshuffle) — *unsupported* by default, decoded when the matching Cargo features (or `all-filters`) are enabled |
 | `fsm_paged.h5` | 3 | Paged file-space strategy with persistent free-space managers, after deletions |
 | `groups_earliest.h5` | 0 | Symbol-table groups: nested, empty, 100 entries (multi-node B-tree), soft (absolute, relative, dangling), external and repeated hard links |
 | `groups_latest.h5` | 3 | Link-message groups: same as above with dense link storage for 100 links, creation-order tracked groups (compact and dense) |
