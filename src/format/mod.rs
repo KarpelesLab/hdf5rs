@@ -4,8 +4,10 @@
 //! closely; the friendly public API is built on top of it.
 
 mod reader;
+mod symbol_table_entry;
 
 pub use reader::ByteReader;
+pub use symbol_table_entry::{ScratchPad, SymbolTableEntry};
 
 /// The "undefined address" value, after widening to 64 bits.
 ///
