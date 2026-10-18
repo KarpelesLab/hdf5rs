@@ -43,7 +43,7 @@ validated end-to-end against the fixture corpus as the high-level API lands.
 - [x] Jenkins `lookup3` checksum (§ checksum used by v2 structures)
 - [x] Test fixture corpus: script (outside the crate build) that generates a
       set of `.h5` files with h5py, plus checked-in small fixtures
-- [ ] Basic fuzz harness (`cargo fuzz`, kept out of the published crate)
+- [x] Basic fuzz harness (`cargo fuzz`, kept out of the published crate)
 
 ## Milestone 1 — Read: file structure (`0.1`)
 
@@ -114,7 +114,7 @@ Goal: read the vast majority of real-world files, including compressed ones.
 - [x] Optional `compcol`-backed features: `zstd`, `lz4`, `bzip2`, `blosc`,
       `bitshuffle` (`all-filters`); blosclz unsupported; high-level zstd
       decoding pending a compcol fix
-- [ ] Chunk cache with configurable size
+- [x] Chunk cache with configurable size
 - [x] Virtual dataset layout (layout v4, class 3) — read, same-file and
       external sources
 
@@ -151,11 +151,11 @@ Goal: create new files that the reference tools read without complaint.
 
 ## Milestone 6 — Hardening and ergonomics (`0.6` → `1.0`)
 
-- [ ] Fuzzing of all parsers in CI (time-boxed), with corpus seeded from
+- [x] Fuzzing of all parsers in CI (time-boxed), with corpus seeded from
       fixtures
-- [ ] Resource limits for untrusted input (max allocation, max recursion
+- [x] Resource limits for untrusted input (max allocation, max recursion
       depth, max chunk size)
-- [ ] Performance: avoid per-element allocations, vectorizable byte-order
+- [x] Performance: avoid per-element allocations, vectorizable byte-order
       conversion, parallel chunk decoding behind an optional feature
 - [ ] Optional `ndarray` integration feature
 - [ ] Optional derive macro crate (`hdf5rs-derive`) for compound types
