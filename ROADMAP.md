@@ -88,7 +88,7 @@ Goal: read the raw contents of uncompressed datasets and attributes.
       attribute storage (fractal heap + v2 B-tree)
 - [x] Shared object header messages (committed datatypes, SOHM table
       `SMTB` / `SMLI`) — read side
-- [ ] Typed read API: `dataset.read::<T>()` into `Vec<T>` for primitive
+- [x] Typed read API: `dataset.read::<T>()` into `Vec<T>` for primitive
       types, plus a raw-bytes + datatype-descriptor path for everything else;
       a small `H5Type` trait users can implement (derive macro later, as a
       separate optional crate)
@@ -114,7 +114,7 @@ Goal: read the vast majority of real-world files, including compressed ones.
 - [ ] Optional `compcol`-backed features for Zstd, LZ4, bzip2 (and Blosc
       framing on top of them)
 - [ ] Chunk cache with configurable size
-- [ ] Virtual dataset layout (layout v4, class 3) — read, same-file and
+- [x] Virtual dataset layout (layout v4, class 3) — read, same-file and
       external sources
 
 ## Milestone 4 — Write: basic files (`0.4`)
