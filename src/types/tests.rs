@@ -1508,3 +1508,65 @@ fn mutations_never_panic() {
         try_all(&dt, &bytes[..cut], &ctx);
     }
 }
+
+// ------------------------------------------- selections -> read selections
+
+#[test]
+fn selection_conversion() {
+    use crate::read::{HyperslabDim as H, Selection as S};
+    let blk = |s: &[u64], e: &[u64]| HyperslabBlock {
+        start: s.to_vec(),
+        end: e.to_vec(),
+    };
+    assert_eq!(Selection::None.to_read_selection().unwrap(), None);
+    assert_eq!(Selection::All.to_read_selection().unwrap(), Some(S::All));
+    let reg = Selection::RegularHyperslab {
+        start: vec![1, 0],
+        stride: vec![3, 1],
+        count: vec![2, 1],
+        block: vec![2, 4],
+    };
+    assert_eq!(
+        reg.to_read_selection().unwrap(),
+        Some(S::Hyperslab(vec![H::new(1, 3, 2, 2), H::new(0, 1, 1, 4)]))
+    );
+    // A cartesian product of blocks, listed in any order.
+    let grid = Selection::Hyperslab {
+        rank: 2,
+        blocks: vec![
+            blk(&[4, 0], &[4, 1]),
+            blk(&[0, 0], &[0, 1]),
+            blk(&[0, 5], &[0, 6]),
+            blk(&[4, 5], &[4, 6]),
+        ],
+    };
+    assert_eq!(
+        grid.to_read_selection().unwrap(),
+        Some(S::Hyperslab(vec![H::new(0, 4, 2, 1), H::new(0, 5, 2, 2)]))
+    );
+    // Irregular: a missing corner, unequal blocks, uneven spacing.
+    for blocks in [
+        vec![blk(&[0, 0], &[0, 0]), blk(&[2, 2], &[2, 2])],
+        vec![blk(&[0], &[1]), blk(&[4], &[4])],
+        vec![blk(&[0], &[0]), blk(&[2], &[2]), blk(&[5], &[5])],
+        vec![blk(&[0], &[3]), blk(&[2], &[5])],
+    ] {
+        let rank = blocks[0].start.len() as u32;
+        assert!(matches!(
+            Selection::Hyperslab { rank, blocks }.to_read_selection(),
+            Err(Error::Unsupported(_))
+        ));
+    }
+    let pts = Selection::Points {
+        rank: 1,
+        points: vec![vec![1]],
+    };
+    assert!(matches!(
+        pts.to_read_selection(),
+        Err(Error::Unsupported(_))
+    ));
+    // parse_prefix reports the encoded length of "all" (8 + 8 bytes).
+    let mut enc = vec![3, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    enc.extend([0xaa; 4]);
+    assert_eq!(Selection::parse_prefix(&enc).unwrap(), (Selection::All, 16));
+}

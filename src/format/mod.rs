@@ -21,6 +21,7 @@ mod symbol_table_entry;
 pub mod symbol_table_node;
 #[cfg(test)]
 pub(crate) mod test_util;
+pub mod vds;
 
 pub use reader::ByteReader;
 pub use symbol_table_entry::{ScratchPad, SymbolTableEntry};

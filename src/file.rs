@@ -18,6 +18,7 @@ use crate::format::{Sizes, UNDEFINED_ADDRESS};
 use crate::group::Group;
 use crate::io::ReadAt;
 use crate::object::Object;
+use crate::read::ExternalFileResolver;
 
 /// A thread-safe, shareable byte store.
 pub type SharedStore = Arc<dyn ReadAt + Send + Sync>;
@@ -28,6 +29,69 @@ const HEADER_CACHE_CAPACITY: usize = 1024;
 /// Maximum chain length when a shared message points to another shared
 /// message.
 const MAX_SHARED_DEPTH: u32 = 8;
+
+/// Policy for accessing files other than the HDF5 file itself.
+///
+/// Three features may open other files, always resolved relative to the
+/// directory of the file opened with [`File::open`] / [`File::open_with`]
+/// (files opened from memory or a custom reader cannot open other files):
+///
+/// - **external raw data files** (External Data Files message);
+/// - **virtual dataset sources** stored in other files;
+/// - **external links**, which are only followed automatically when
+///   [`follow_external_links`](Self::follow_external_links) is enabled, or
+///   explicitly through [`Group::follow_external`].
+///
+/// # Security
+///
+/// The file names come from the HDF5 file. Absolute names and names with
+/// `..` components are honoured by default (as the reference library
+/// does), so an untrusted file can make the reader open, and return the
+/// contents of, any file readable by the process. When reading untrusted
+/// files, either disable access to other files entirely
+/// (`external_files(false)`) or confine names to the file's directory and
+/// its subdirectories (`confine_to_directory(true)`, which rejects absolute
+/// names and `..` components; symbolic links are still followed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct FileAccess {
+    /// Allow opening other files at all (default `true`).
+    pub external_files: bool,
+    /// Reject absolute names and `..` components (default `false`).
+    pub confine_to_directory: bool,
+    /// Follow external links during path resolution (default `false`).
+    pub follow_external_links: bool,
+}
+
+impl Default for FileAccess {
+    fn default() -> Self {
+        FileAccess {
+            external_files: true,
+            confine_to_directory: false,
+            follow_external_links: false,
+        }
+    }
+}
+
+impl FileAccess {
+    /// Allow or forbid opening other files.
+    pub fn external_files(mut self, allow: bool) -> Self {
+        self.external_files = allow;
+        self
+    }
+
+    /// Confine other files to the HDF5 file's directory tree.
+    pub fn confine_to_directory(mut self, confine: bool) -> Self {
+        self.confine_to_directory = confine;
+        self
+    }
+
+    /// Follow external links automatically when resolving paths.
+    pub fn follow_external_links(mut self, follow: bool) -> Self {
+        self.follow_external_links = follow;
+        self
+    }
+}
 
 /// An open HDF5 file (read-only).
 ///
@@ -43,6 +107,7 @@ struct FileInner {
     store: SharedStore,
     superblock: Superblock,
     path: Option<PathBuf>,
+    access: FileAccess,
     headers: Mutex<HashMap<u64, Arc<ObjectHeader>>>,
     /// `None` = not loaded yet; `Some(None)` = file has no SOHM table.
     sohm: Mutex<Option<Option<Arc<SohmTable>>>>,
@@ -64,22 +129,92 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 impl File {
     /// Open the HDF5 file at `path`.
     pub fn open(path: impl AsRef<Path>) -> Result<File> {
+        Self::open_with(path, FileAccess::default())
+    }
+
+    /// Open the HDF5 file at `path` with a policy for accessing other files
+    /// (see [`FileAccess`]).
+    pub fn open_with(path: impl AsRef<Path>, access: FileAccess) -> Result<File> {
         let path = path.as_ref();
         let f = std::fs::File::open(path)?;
-        Self::with_store(Arc::new(f), Some(path.to_path_buf()))
+        Self::with_store(Arc::new(f), Some(path.to_path_buf()), access)
     }
 
     /// Open an HDF5 file held in memory.
     pub fn from_bytes(data: Vec<u8>) -> Result<File> {
-        Self::with_store(Arc::new(data), None)
+        Self::with_store(Arc::new(data), None, FileAccess::default())
     }
 
     /// Open an HDF5 file from any positional reader.
     pub fn from_reader<R: ReadAt + Send + Sync + 'static>(reader: R) -> Result<File> {
-        Self::with_store(Arc::new(reader), None)
+        Self::with_store(Arc::new(reader), None, FileAccess::default())
     }
 
-    fn with_store(raw: SharedStore, path: Option<PathBuf>) -> Result<File> {
+    /// The policy for accessing other files.
+    pub fn access(&self) -> FileAccess {
+        self.inner.access
+    }
+
+    /// Resolve `name` (a file name stored in this file: external data file,
+    /// virtual dataset source or external link target) against this file's
+    /// directory, honouring the [`FileAccess`] policy.
+    ///
+    /// Fails with [`Error::Unsupported`] when the file was not opened from
+    /// a path or access to other files is disabled, and with
+    /// [`Error::InvalidFormat`] when a confined name escapes the directory.
+    pub fn resolve_related_path(&self, name: &str) -> Result<PathBuf> {
+        let access = self.inner.access;
+        if !access.external_files {
+            return Err(Error::unsupported(format!(
+                "access to other files is disabled (needed for {name:?})"
+            )));
+        }
+        let Some(path) = self.inner.path.as_deref() else {
+            return Err(Error::unsupported(format!(
+                "cannot open {name:?}: the file was not opened from a path"
+            )));
+        };
+        let dir = path.parent().unwrap_or_else(|| Path::new(""));
+        let rel = Path::new(name);
+        if name.is_empty() {
+            return Err(Error::invalid("empty external file name"));
+        }
+        if access.confine_to_directory {
+            use std::path::Component;
+            if rel.components().any(|c| {
+                matches!(
+                    c,
+                    Component::RootDir | Component::Prefix(_) | Component::ParentDir
+                )
+            }) {
+                return Err(Error::invalid(format!(
+                    "external file name {name:?} escapes the file's directory"
+                )));
+            }
+        }
+        Ok(dir.join(rel))
+    }
+
+    /// Open another HDF5 file named in this one (virtual dataset source,
+    /// external link target), relative to this file's directory and with
+    /// the same [`FileAccess`] policy. See
+    /// [`resolve_related_path`](Self::resolve_related_path).
+    pub fn open_related(&self, name: &str) -> Result<File> {
+        let p = self.resolve_related_path(name)?;
+        File::open_with(p, self.inner.access)
+    }
+
+    /// The default resolver for external raw data files: names relative to
+    /// this file's directory, per the [`FileAccess`] policy. `None` when
+    /// other files cannot be opened.
+    pub(crate) fn external_resolver(&self) -> Option<RelativeResolver> {
+        if !self.inner.access.external_files || self.inner.path.is_none() {
+            return None;
+        }
+        Some(RelativeResolver { file: self.clone() })
+    }
+
+    fn with_store(raw: SharedStore, path: Option<PathBuf>, access: FileAccess) -> Result<File> {
         let superblock = Superblock::read(&raw)?;
         let store: SharedStore = if superblock.base() == 0 {
             raw
@@ -91,6 +226,7 @@ impl File {
                 store,
                 superblock,
                 path,
+                access,
                 headers: Mutex::new(HashMap::new()),
                 sohm: Mutex::new(None),
             }),
@@ -266,6 +402,18 @@ impl File {
                 "message flagged shared but encoding says it is not shared",
             )),
         }
+    }
+}
+
+/// Opens external raw data files relative to an HDF5 file's directory.
+pub(crate) struct RelativeResolver {
+    file: File,
+}
+
+impl ExternalFileResolver for RelativeResolver {
+    fn open(&self, name: &str) -> Result<Box<dyn ReadAt>> {
+        let p = self.file.resolve_related_path(name)?;
+        Ok(Box::new(std::fs::File::open(p)?))
     }
 }
 

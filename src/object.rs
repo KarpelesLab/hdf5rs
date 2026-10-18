@@ -217,6 +217,12 @@ impl Object {
         }
     }
 
+    /// The file this object belongs to (differs from the starting file for
+    /// objects reached through external links).
+    pub fn file(&self) -> &File {
+        &self.node().file
+    }
+
     /// Address of the object header.
     pub fn address(&self) -> u64 {
         self.node().header.address

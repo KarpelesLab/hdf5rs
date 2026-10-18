@@ -15,7 +15,8 @@ pub enum Link {
         /// Target path (absolute, or relative to the containing group).
         path: String,
     },
-    /// A link to an object in another file. Not followed by this crate.
+    /// A link to an object in another file. Followed only on request (see
+    /// [`Group::follow_external`](crate::Group::follow_external)).
     External {
         /// Name of the target file.
         file: String,

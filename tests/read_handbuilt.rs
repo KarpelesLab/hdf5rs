@@ -356,7 +356,143 @@ fn corrupted_files_do_not_panic() {
                 for p in ["child", "soft", "data", "alias", "loop", "ext"] {
                     let _ = f.object(p);
                 }
+                if let Ok(d) = f.dataset("data") {
+                    let _ = d.read_values();
+                }
             }
         }
     }
+}
+
+/// Superblock v2 file whose root links `ext` to a 3-element i32 dataset
+/// stored in the external raw data file `raw_name` (bytes 4..16).
+fn external_data_file(raw_name: &str) -> Vec<u8> {
+    let mut b = B::default();
+    let mut sb = hdf5rs::SIGNATURE.to_vec();
+    sb.extend([2, 8, 8, 0]);
+    sb.extend(u64le(0));
+    sb.extend(u64le(UNDEF));
+    sb.extend(u64le(700));
+    sb.extend(u64le(48));
+    let sum = metadata_checksum(&sb);
+    sb.extend(u32le(sum));
+    b.put(0, &sb);
+    let mut link_info = vec![0, 0];
+    link_info.extend(u64le(UNDEF));
+    link_info.extend(u64le(UNDEF));
+    b.put(
+        48,
+        &ohdr_v2(&[
+            (0x02, link_info),
+            (0x06, link_msg("ext", &Link::Hard { address: 300 })),
+        ]),
+    );
+    let mut space = vec![2, 1, 0, 1];
+    space.extend(u64le(3));
+    let mut layout = vec![3, 1];
+    layout.extend(u64le(UNDEF));
+    layout.extend(u64le(12));
+    let mut efl = vec![1, 0, 0, 0];
+    efl.extend(u16le(1));
+    efl.extend(u16le(1));
+    efl.extend(u64le(500));
+    for v in [8u64, 4, 12] {
+        efl.extend(u64le(v));
+    }
+    b.put(
+        300,
+        &ohdr_v2(&[
+            (0x01, space),
+            (0x03, I32.to_vec()),
+            (0x08, layout),
+            (0x07, efl),
+        ]),
+    );
+    // Local heap with the file name at offset 8.
+    let mut seg = vec![0u8; 8];
+    seg.extend(raw_name.as_bytes());
+    seg.push(0);
+    pad8(&mut seg);
+    let mut heap = b"HEAP".to_vec();
+    heap.extend([0, 0, 0, 0]);
+    heap.extend(u64le(seg.len() as u64));
+    heap.extend(u64le(UNDEF));
+    heap.extend(u64le(540));
+    b.put(500, &heap);
+    b.put(540, &seg);
+    b.data.resize(700, 0);
+    b.data
+}
+
+#[test]
+fn external_raw_data_files() {
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("hdf5rs_external_{}", std::process::id()));
+    let sub = dir.join("sub");
+    std::fs::create_dir_all(&sub).unwrap();
+    let mut raw = vec![0xee; 4];
+    for v in [7i32, -8, 9] {
+        raw.extend(v.to_le_bytes());
+    }
+    std::fs::write(dir.join("raw.bin"), &raw).unwrap();
+    std::fs::write(dir.join("plain.h5"), external_data_file("raw.bin")).unwrap();
+    std::fs::write(sub.join("up.h5"), external_data_file("../raw.bin")).unwrap();
+
+    let f = File::open(dir.join("plain.h5")).unwrap();
+    let d = f.dataset("ext").unwrap();
+    assert_eq!(d.external_files().unwrap()[0].name, "raw.bin");
+    assert_eq!(d.read::<i32>().unwrap(), [7, -8, 9]);
+    assert_eq!(
+        d.read_selection::<i64>(&hdf5rs::Selection::range(1..3))
+            .unwrap(),
+        [-8, 9]
+    );
+
+    // Custom resolver.
+    let resolver = |name: &str| -> hdf5rs::Result<Box<dyn hdf5rs::ReadAt>> {
+        assert_eq!(name, "raw.bin");
+        let mut v = vec![0u8; 4];
+        v.extend([1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0]);
+        Ok(Box::new(v))
+    };
+    assert_eq!(
+        d.reader()
+            .external_resolver(&resolver)
+            .read::<i32>()
+            .unwrap(),
+        [1, 2, 3]
+    );
+
+    // From memory: no directory to resolve against.
+    let mem = File::from_bytes(std::fs::read(dir.join("plain.h5")).unwrap()).unwrap();
+    assert!(matches!(
+        mem.dataset("ext").unwrap().read::<i32>(),
+        Err(Error::Unsupported(_))
+    ));
+    // Disabled.
+    let locked = File::open_with(
+        dir.join("plain.h5"),
+        hdf5rs::FileAccess::default().external_files(false),
+    )
+    .unwrap();
+    assert!(matches!(
+        locked.dataset("ext").unwrap().read::<i32>(),
+        Err(Error::Unsupported(_))
+    ));
+    // `..` components: honoured by default, rejected when confined.
+    let up = File::open(sub.join("up.h5")).unwrap();
+    assert_eq!(
+        up.dataset("ext").unwrap().read::<i32>().unwrap(),
+        [7, -8, 9]
+    );
+    let confined = File::open_with(
+        sub.join("up.h5"),
+        hdf5rs::FileAccess::default().confine_to_directory(true),
+    )
+    .unwrap();
+    assert!(matches!(
+        confined.dataset("ext").unwrap().read::<i32>(),
+        Err(Error::InvalidFormat(_))
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
 }

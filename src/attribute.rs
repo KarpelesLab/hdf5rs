@@ -12,9 +12,11 @@ use crate::format::fractal_heap::FractalHeap;
 use crate::format::messages::MessageType;
 use crate::format::messages::attribute::{Attribute as AttributeMessage, MaybeShared};
 use crate::format::messages::attribute_info::AttributeInfo;
-use crate::format::messages::dataspace::Dataspace;
+use crate::format::messages::dataspace::{Dataspace, DataspaceKind};
 use crate::format::messages::datatype::{CharacterSet, Datatype};
 use crate::format::object_header::{ObjectHeader, RawMessage};
+use crate::reader::{Array, decode_elements, single};
+use crate::types::{H5Type, Value};
 
 /// An attribute, fully loaded: name, datatype, dataspace and raw value.
 ///
@@ -84,6 +86,79 @@ impl Attribute {
     pub fn file(&self) -> &File {
         &self.file
     }
+
+    /// Decode every element into `T`, in row-major order (variable-length
+    /// data and region references are resolved through the file).
+    pub fn read<T: H5Type>(&self) -> Result<Vec<T>> {
+        decode_elements(&self.file, &self.datatype, &self.data)
+    }
+
+    /// Decode every element together with the attribute's shape.
+    pub fn read_nd<T: H5Type>(&self) -> Result<Array<T>> {
+        Ok(Array {
+            data: self.read()?,
+            shape: self.dataspace.dims.clone(),
+        })
+    }
+
+    /// Decode the single element of a scalar (or one-element) attribute.
+    pub fn read_scalar<T: H5Type>(&self) -> Result<T> {
+        single(self.read()?, &format!("attribute {:?}", self.name))
+    }
+
+    /// Every element as a dynamic [`Value`].
+    pub fn values(&self) -> Result<Vec<Value>> {
+        self.read()
+    }
+
+    /// The value as one dynamic [`Value`]: the element itself for scalar
+    /// attributes, a [`Value::Array`] of the elements (nested, slowest
+    /// dimension outermost) for simple dataspaces, and an empty
+    /// [`Value::Array`] for null dataspaces.
+    pub fn value(&self) -> Result<Value> {
+        let values = self.values()?;
+        match self.dataspace.kind {
+            DataspaceKind::Scalar => single(values, &format!("attribute {:?}", self.name)),
+            DataspaceKind::Null => Ok(Value::Array(Vec::new())),
+            DataspaceKind::Simple => nest(values, &self.dataspace.dims),
+        }
+    }
+}
+
+/// Most empty sub-arrays built for a value with zero-size inner dimensions.
+const MAX_EMPTY_ROWS: usize = 1 << 20;
+
+/// Nest a flat row-major list of values according to `dims`.
+fn nest(values: Vec<Value>, dims: &[u64]) -> Result<Value> {
+    let Some((_, rest)) = dims.split_first() else {
+        return single(values, "value");
+    };
+    if rest.is_empty() {
+        return Ok(Value::Array(values));
+    }
+    let inner = rest
+        .iter()
+        .try_fold(1usize, |acc, &d| acc.checked_mul(usize::try_from(d).ok()?))
+        .ok_or(Error::LimitExceeded("attribute shape"))?;
+    if inner == 0 {
+        // Zero-size inner dimensions: `dims[0]` empty sub-arrays.
+        let n = usize::try_from(dims[0])
+            .ok()
+            .filter(|&n| n <= MAX_EMPTY_ROWS)
+            .ok_or(Error::LimitExceeded("attribute shape"))?;
+        let empty = nest(Vec::new(), rest)?;
+        return Ok(Value::Array(vec![empty; n]));
+    }
+    let mut out = Vec::with_capacity(values.len() / inner);
+    let mut it = values.into_iter();
+    loop {
+        let chunk: Vec<Value> = it.by_ref().take(inner).collect();
+        if chunk.is_empty() {
+            break;
+        }
+        out.push(nest(chunk, rest)?);
+    }
+    Ok(Value::Array(out))
 }
 
 /// Resolve a datatype field of an attribute, returning the type and, for

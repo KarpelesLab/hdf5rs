@@ -146,8 +146,10 @@ impl Group {
 
     /// The object at `path`, relative to this group (or absolute when it
     /// starts with `/`). Soft links are followed (up to
-    /// [`MAX_SOFT_LINK_HOPS`]); external links fail with
-    /// [`Error::Unsupported`].
+    /// [`MAX_SOFT_LINK_HOPS`], external links included); external links
+    /// fail with [`Error::Unsupported`] unless the file was opened with
+    /// [`FileAccess::follow_external_links`](crate::FileAccess::follow_external_links)
+    /// (see also [`follow_external`](Self::follow_external)).
     pub fn object(&self, path: &str) -> Result<Object> {
         let mut hops = 0;
         self.resolve(path, &mut hops)
@@ -198,6 +200,41 @@ impl Group {
         }
     }
 
+    /// Follow the external link called `name` (a single path component) in
+    /// this group: open the target file relative to this file's directory
+    /// (see [`File::open_related`](crate::File::open_related) and
+    /// [`FileAccess`](crate::FileAccess)) and return the target object.
+    ///
+    /// This works whether or not automatic following is enabled; it fails
+    /// with [`Error::WrongObjectType`] if the link is not external.
+    pub fn follow_external(&self, name: &str) -> Result<Object> {
+        match self.link(name)? {
+            Link::External { file, path } => {
+                let mut hops = 0;
+                self.resolve_external(&file, &path, &mut hops)
+            }
+            _ => Err(Error::WrongObjectType(format!(
+                "{} is not an external link",
+                self.child_path(name)
+            ))),
+        }
+    }
+
+    fn resolve_external(&self, file: &str, path: &str, hops: &mut usize) -> Result<Object> {
+        *hops += 1;
+        if *hops > MAX_SOFT_LINK_HOPS {
+            return Err(Error::LimitExceeded("soft/external link hops"));
+        }
+        let target = self.node.file.open_related(file)?;
+        let root = target.root()?;
+        let abs = if path.starts_with('/') {
+            path.to_owned()
+        } else {
+            format!("/{path}")
+        };
+        root.resolve(&abs, hops)
+    }
+
     fn resolve(&self, path: &str, hops: &mut usize) -> Result<Object> {
         let mut current: Object = if path.starts_with('/') {
             Object::Group(self.node.file.root()?)
@@ -230,10 +267,13 @@ impl Group {
                         .with_path(group.child_path(comp).into())
                 }
                 Link::External { file, path: p } => {
-                    return Err(Error::unsupported(format!(
-                        "external link {} -> {file}:{p} is not followed",
-                        group.child_path(comp)
-                    )));
+                    if !group.node.file.access().follow_external_links {
+                        return Err(Error::unsupported(format!(
+                            "external link {} -> {file}:{p} is not followed",
+                            group.child_path(comp)
+                        )));
+                    }
+                    group.resolve_external(&file, &p, hops)?
                 }
                 Link::UserDefined { link_type, .. } => {
                     return Err(Error::unsupported(format!(

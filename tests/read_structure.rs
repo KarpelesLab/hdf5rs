@@ -167,8 +167,8 @@ fn check_dtype(ctx: &str, expect: &Json, dt: &Datatype) {
         ),
         // The manifest records NumPy's in-memory size, which differs from
         // the file's for types containing variable-length members.
-        Some(Json::Num(n)) if !has_vlen(dt) => {
-            assert_eq!(u64::from(dt.size), *n as u64, "{ctx}: datatype size")
+        Some(n @ (Json::Num(_) | Json::Int(_))) if !has_vlen(dt) => {
+            assert_eq!(Some(u64::from(dt.size)), n.u64(), "{ctx}: datatype size")
         }
         _ => {}
     }
@@ -262,9 +262,9 @@ fn check_attributes(ctx: &str, expect: &Json, obj: &Object) {
         }
         if let Some(v) = scalar_int(attr.datatype(), attr.raw_value())
             && attr.dataspace().kind == DataspaceKind::Scalar
-            && let Some(Json::Num(want)) = a.get("data")
+            && let Some(want) = a.get("data").and_then(Json::num)
         {
-            assert_eq!(v as f64, *want, "{actx}: value");
+            assert_eq!(v as f64, want, "{actx}: value");
         }
         let n = attr.element_count().unwrap();
         assert_eq!(

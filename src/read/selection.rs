@@ -70,6 +70,40 @@ impl HyperslabDim {
         self.count == 0 || self.block == 0
     }
 
+    /// Coordinate of the `i`-th selected element (normalized, in-range
+    /// selections only).
+    pub(crate) fn coord(&self, i: u64) -> u64 {
+        let block = self.block.max(1);
+        self.start
+            .saturating_add((i / block).saturating_mul(self.stride))
+            .saturating_add(i % block)
+    }
+
+    /// Position within the selection of coordinate `c`, if selected.
+    pub(crate) fn index_of(&self, c: u64) -> Option<u64> {
+        if self.is_empty() || c < self.start {
+            return None;
+        }
+        let off = c - self.start;
+        let stride = self.stride.max(1);
+        let (b, w) = (off / stride, off % stride);
+        if b >= self.count || w >= self.block {
+            return None;
+        }
+        b.checked_mul(self.block)?.checked_add(w)
+    }
+
+    /// One past the last selected coordinate (normalized selections).
+    pub(crate) fn end(&self) -> u64 {
+        if self.is_empty() {
+            return self.start;
+        }
+        (self.count - 1)
+            .saturating_mul(self.stride)
+            .saturating_add(self.start)
+            .saturating_add(self.block)
+    }
+
     /// Check the hyperslab against a dimension of size `dim` and return its
     /// canonical form (adjacent blocks merged; empty selections become
     /// `count == 0`).

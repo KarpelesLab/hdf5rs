@@ -9,6 +9,8 @@ pub enum Json {
     Null,
     Bool(bool),
     Num(f64),
+    /// An integer literal, kept exact.
+    Int(i128),
     Str(String),
     Arr(Vec<Json>),
     /// Keys in document order.
@@ -44,12 +46,24 @@ impl Json {
     pub fn num(&self) -> Option<f64> {
         match self {
             Json::Num(n) => Some(*n),
+            Json::Int(i) => Some(*i as f64),
             _ => None,
         }
     }
 
     pub fn u64(&self) -> Option<u64> {
-        self.num().map(|n| n as u64)
+        match self {
+            Json::Int(i) => u64::try_from(*i).ok(),
+            _ => self.num().map(|n| n as u64),
+        }
+    }
+
+    /// An exact integer literal.
+    pub fn int(&self) -> Option<i128> {
+        match self {
+            Json::Int(i) => Some(*i),
+            _ => None,
+        }
     }
 
     pub fn bool(&self) -> Option<bool> {
@@ -162,7 +176,10 @@ impl Parser<'_> {
                     self.i += 1;
                 }
                 let s = std::str::from_utf8(&self.b[start..self.i]).unwrap();
-                Json::Num(s.parse().unwrap_or_else(|_| panic!("bad number {s:?}")))
+                match s.parse::<i128>() {
+                    Ok(i) => Json::Int(i),
+                    Err(_) => Json::Num(s.parse().unwrap_or_else(|_| panic!("bad number {s:?}"))),
+                }
             }
         }
     }

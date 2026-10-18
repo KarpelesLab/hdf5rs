@@ -129,25 +129,140 @@ impl Selection {
     /// Trailing bytes are ignored.
     pub fn parse(data: &[u8]) -> Result<Selection> {
         let mut r = ByteReader::new(data);
-        let sel_type = r.read_u32()?;
-        let version = r.read_u32()?;
-        match sel_type {
-            0 | 3 => {
-                if version != 1 {
-                    return Err(Error::unsupported(format!(
-                        "selection info version {version}"
-                    )));
+        parse_selection(&mut r, false)
+    }
+
+    /// Parse an encoded selection at the start of `data`, returning it with
+    /// the number of bytes it occupies (for selections followed by other
+    /// fields, as in the virtual dataset global heap block).
+    pub fn parse_prefix(data: &[u8]) -> Result<(Selection, usize)> {
+        let mut r = ByteReader::new(data);
+        let sel = parse_selection(&mut r, true)?;
+        Ok((sel, r.position()))
+    }
+
+    /// The equivalent [`read::Selection`](crate::read::Selection), or
+    /// `None` when nothing is selected.
+    ///
+    /// "All", regular hyperslabs and block lists forming a regular pattern
+    /// (one block, or the cartesian product of equally sized, equally
+    /// spaced blocks per dimension) are converted; point selections and
+    /// irregular block lists fail with [`Error::Unsupported`]. Bounds are
+    /// not checked here (they are when the selection is used against a
+    /// dataspace).
+    pub fn to_read_selection(&self) -> Result<Option<crate::read::Selection>> {
+        use crate::read::{HyperslabDim, Selection as Sel};
+        match self {
+            Selection::None => Ok(None),
+            Selection::All => Ok(Some(Sel::All)),
+            Selection::RegularHyperslab {
+                start,
+                stride,
+                count,
+                block,
+            } => {
+                let n = start.len();
+                if stride.len() != n || count.len() != n || block.len() != n {
+                    return Err(Error::invalid("regular hyperslab with mismatched ranks"));
                 }
-                Ok(if sel_type == 0 {
-                    Selection::None
-                } else {
-                    Selection::All
-                })
+                let dims = (0..n)
+                    .map(|i| HyperslabDim::new(start[i], stride[i], count[i], block[i]))
+                    .collect::<Vec<_>>();
+                if dims.iter().any(HyperslabDim::is_empty) {
+                    return Ok(None);
+                }
+                Ok(Some(Sel::Hyperslab(dims)))
             }
-            1 => parse_points(&mut r, version),
-            2 => parse_hyperslab(&mut r, version),
-            other => Err(Error::invalid(format!("unknown selection type {other}"))),
+            Selection::Hyperslab { rank, blocks } => {
+                if blocks.is_empty() {
+                    return Ok(None);
+                }
+                regular_from_blocks(*rank as usize, blocks).map(|d| Some(Sel::Hyperslab(d)))
+            }
+            Selection::Points { .. } => Err(Error::unsupported("point selections")),
         }
+    }
+}
+
+/// Recognize a block list that is the cartesian product of one regular
+/// pattern per dimension.
+fn regular_from_blocks(
+    rank: usize,
+    blocks: &[HyperslabBlock],
+) -> Result<Vec<crate::read::HyperslabDim>> {
+    use crate::read::HyperslabDim;
+    let irregular = || Error::unsupported("irregular hyperslab selection");
+    let mut dims = Vec::with_capacity(rank);
+    let mut product = 1usize;
+    for d in 0..rank {
+        let mut iv: Vec<(u64, u64)> = Vec::with_capacity(blocks.len());
+        for b in blocks {
+            let (Some(&s), Some(&e)) = (b.start.get(d), b.end.get(d)) else {
+                return Err(Error::invalid("hyperslab block rank mismatch"));
+            };
+            if e < s {
+                return Err(Error::invalid("hyperslab block ends before it starts"));
+            }
+            iv.push((s, e));
+        }
+        iv.sort_unstable();
+        iv.dedup();
+        let Some(&(first, first_end)) = iv.first() else {
+            return Err(irregular());
+        };
+        let size = first_end - first + 1;
+        let stride = match iv.get(1) {
+            Some(&(s, _)) => s - first,
+            None => size,
+        };
+        for (k, &(s, e)) in iv.iter().enumerate() {
+            let want = (k as u64)
+                .checked_mul(stride)
+                .and_then(|o| o.checked_add(first));
+            if e - s + 1 != size || want != Some(s) {
+                return Err(irregular());
+            }
+        }
+        if iv.len() > 1 && stride < size {
+            return Err(irregular());
+        }
+        product = product.checked_mul(iv.len()).ok_or_else(irregular)?;
+        dims.push(HyperslabDim::new(first, stride, iv.len() as u64, size));
+    }
+    // Every block takes its coordinates from the per-dimension patterns, so
+    // `product` distinct blocks are exactly the cartesian product.
+    let mut starts: Vec<&[u64]> = blocks.iter().map(|b| b.start.as_slice()).collect();
+    starts.sort_unstable();
+    starts.dedup();
+    if starts.len() != product || blocks.len() != product {
+        return Err(irregular());
+    }
+    Ok(dims)
+}
+
+fn parse_selection(r: &mut ByteReader<'_>, prefix: bool) -> Result<Selection> {
+    let sel_type = r.read_u32()?;
+    let version = r.read_u32()?;
+    match sel_type {
+        0 | 3 => {
+            if version != 1 {
+                return Err(Error::unsupported(format!(
+                    "selection info version {version}"
+                )));
+            }
+            if prefix {
+                // Reserved (4 bytes) and length (4 bytes, zero).
+                r.skip(8)?;
+            }
+            Ok(if sel_type == 0 {
+                Selection::None
+            } else {
+                Selection::All
+            })
+        }
+        1 => parse_points(r, version),
+        2 => parse_hyperslab(r, version),
+        other => Err(Error::invalid(format!("unknown selection type {other}"))),
     }
 }
 

@@ -41,7 +41,9 @@
 //!   fill value; filters are applied per chunk honouring each chunk's
 //!   filter mask.
 //!
-//! Virtual datasets are not supported yet ([`Error::Unsupported`]).
+//! Virtual datasets need access to other datasets (and possibly other
+//! files), so [`read_raw`] rejects them with [`Error::Unsupported`]; read
+//! them through [`Dataset`](crate::Dataset), which resolves the mappings.
 //!
 //! # Chunk coordinates
 //!
@@ -58,6 +60,7 @@
 mod chunked;
 mod contiguous;
 mod selection;
+mod virtual_layout;
 // The synthetic files use deflate-compressed chunks.
 #[cfg(all(test, feature = "deflate"))]
 mod tests;
@@ -66,6 +69,7 @@ use std::sync::OnceLock;
 
 pub use chunked::ChunkInfo;
 pub use selection::{HyperslabDim, Selection};
+pub(crate) use virtual_layout::read_virtual;
 
 use crate::error::{Error, Result};
 use crate::filters::FilterRegistry;

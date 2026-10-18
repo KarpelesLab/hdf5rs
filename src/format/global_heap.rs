@@ -107,11 +107,17 @@ impl GlobalHeapCollection {
             .filter(|&e| e <= data.len() && e >= r.position())
             .ok_or_else(|| Error::invalid("global heap collection size out of range"))?;
         let mut r = ByteReader::with_sizes(&data[..end], sizes);
-        r.seek(8 + sizes.length as usize)?;
-        let obj_head = 8 + sizes.length as usize;
+        // The collection header and each object header are padded to a
+        // multiple of 8 bytes (only visible with 4-byte lengths, where they
+        // are 12 bytes long; verified on files written by the reference
+        // library).
+        let align8 = |n: usize| n.div_ceil(8) * 8;
+        r.seek(align8(8 + sizes.length as usize).min(end))?;
+        let obj_head = align8(8 + sizes.length as usize);
         let mut objects = Vec::new();
         // A trailing free-space object whose header does not fit is implied.
         while r.remaining() >= obj_head {
+            let start = r.position();
             let index = r.read_u16()?;
             if index == 0 {
                 break;
@@ -120,6 +126,7 @@ impl GlobalHeapCollection {
             r.skip(4)?;
             let size = usize::try_from(r.read_length()?)
                 .map_err(|_| Error::invalid("global heap object too large"))?;
+            r.seek(start + obj_head)?;
             let data = r.read_bytes(size)?.to_vec();
             // Data is padded to a multiple of 8; the padding of the last
             // object may be clipped by the collection end.
@@ -171,8 +178,8 @@ mod tests {
         v.extend(1u16.to_le_bytes());
         v.extend([0; 4]);
         v.extend(FileBuilder::uint(data.len() as u64, sizes.length));
-        // Only the data is padded to a multiple of 8 ("storage space
-        // allocated for the object data is rounded up").
+        // The header and the data are padded to a multiple of 8.
+        v.resize(v.len().div_ceil(8) * 8, 0);
         let mut d = data.to_vec();
         d.resize(d.len().div_ceil(8) * 8, 0);
         v.extend(d);
@@ -183,6 +190,7 @@ mod tests {
         let mut v = b"GCOL".to_vec();
         v.extend([1, 0, 0, 0]);
         v.extend(FileBuilder::uint(size, sizes.length));
+        v.resize(v.len().div_ceil(8) * 8, 0);
         for (i, d) in objs {
             v.extend(object(sizes, *i, d));
         }

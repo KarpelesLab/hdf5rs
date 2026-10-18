@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use crate::attribute::resolve_datatype;
 use crate::error::{Error, Result};
+use crate::format::global_heap::GlobalHeapId;
 use crate::format::local_heap::LocalHeap;
 use crate::format::messages::MessageType;
 use crate::format::messages::attribute::MaybeShared;
@@ -14,7 +15,11 @@ use crate::format::messages::fill_value::{FillValue, FillValueState, OldFillValu
 use crate::format::messages::filter_pipeline::FilterPipeline;
 use crate::format::messages::layout::DataLayout;
 use crate::format::object_header::RawMessage;
+use crate::format::vds::{VirtualMapping, parse_virtual_mappings};
 use crate::object::{Node, object_common};
+use crate::read::{ChunkInfo, Selection};
+use crate::reader::{Array, DatasetReader};
+use crate::types::{GlobalHeapResolver, H5Type, Value, VlenResolver};
 
 /// One segment of a dataset stored in external files.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,6 +44,7 @@ struct Meta {
     fill_value: Option<FillValue>,
     fill_value_old: Option<OldFillValue>,
     external_files: Option<Vec<ExternalFile>>,
+    external_message: Option<ExternalFiles>,
 }
 
 /// A dataset: a multidimensional array of elements of one datatype.
@@ -94,10 +100,12 @@ impl Dataset {
         let fill_value_old = body(MessageType::FILL_VALUE_OLD)?
             .map(|b| OldFillValue::parse(&b, sizes))
             .transpose()?;
-        let external_files = match body(MessageType::EXTERNAL_FILES)? {
+        let external_message = body(MessageType::EXTERNAL_FILES)?
+            .map(|b| ExternalFiles::parse(&b, sizes))
+            .transpose()?;
+        let external_files = match &external_message {
             None => None,
-            Some(b) => {
-                let ef = ExternalFiles::parse(&b, sizes)?;
+            Some(ef) => {
                 let heap = LocalHeap::read(file.store().as_ref(), ef.heap_address, sizes)?;
                 Some(
                     ef.slots
@@ -122,6 +130,7 @@ impl Dataset {
             fill_value,
             fill_value_old,
             external_files,
+            external_message,
         };
         Ok(Dataset {
             node,
@@ -242,6 +251,89 @@ impl Dataset {
     /// messages without a dedicated accessor.
     pub fn raw_message(&self, msg_type: u16) -> Option<&RawMessage> {
         self.node.header.find_message(msg_type)
+    }
+
+    /// The parsed External Data Files message, if any.
+    pub fn external_files_message(&self) -> Option<&ExternalFiles> {
+        self.meta.external_message.as_ref()
+    }
+
+    /// The mappings of a virtual dataset (empty for other layouts).
+    pub fn virtual_mappings(&self) -> Result<Vec<VirtualMapping>> {
+        let DataLayout::Virtual {
+            heap_address,
+            heap_index,
+        } = self.meta.layout
+        else {
+            return Ok(Vec::new());
+        };
+        let file = &self.node.file;
+        let resolver = GlobalHeapResolver::new(file.store().as_ref(), file.sizes());
+        let block = resolver.global_heap_object(&GlobalHeapId {
+            collection_address: heap_address,
+            index: heap_index,
+        })?;
+        parse_virtual_mappings(&block, file.sizes())
+    }
+
+    // ------------------------------------------------------------ reading
+
+    /// A configurable reader (custom filters, limits, external file
+    /// resolver). The `read*` methods of `Dataset` use the defaults.
+    pub fn reader(&self) -> DatasetReader<'_> {
+        DatasetReader::new(self)
+    }
+
+    /// Read every element into `T`, in row-major order.
+    ///
+    /// Variable-length data and region references are resolved through the
+    /// file; virtual datasets are assembled from their sources; external
+    /// raw data files are opened relative to the file (see
+    /// [`FileAccess`](crate::FileAccess)).
+    pub fn read<T: H5Type>(&self) -> Result<Vec<T>> {
+        self.reader().read()
+    }
+
+    /// Read the selected elements into `T`, in row-major order of the
+    /// selection.
+    pub fn read_selection<T: H5Type>(&self, selection: &Selection) -> Result<Vec<T>> {
+        self.reader().read_selection(selection)
+    }
+
+    /// Read every element together with the dataset's shape.
+    pub fn read_nd<T: H5Type>(&self) -> Result<Array<T>> {
+        self.reader().read_nd()
+    }
+
+    /// Read the selected elements together with the selection's shape.
+    pub fn read_selection_nd<T: H5Type>(&self, selection: &Selection) -> Result<Array<T>> {
+        self.reader().read_selection_nd(selection)
+    }
+
+    /// Read the single element of a scalar (or one-element) dataset.
+    pub fn read_scalar<T: H5Type>(&self) -> Result<T> {
+        self.reader().read_scalar()
+    }
+
+    /// Read every element as a dynamic [`Value`].
+    pub fn read_values(&self) -> Result<Vec<Value>> {
+        self.reader().read_values()
+    }
+
+    /// Read the raw bytes of every element, in file byte order.
+    pub fn read_raw(&self) -> Result<Vec<u8>> {
+        self.reader().read_raw()
+    }
+
+    /// Read the raw bytes of the selected elements, in file byte order.
+    pub fn read_raw_selection(&self, selection: &Selection) -> Result<Vec<u8>> {
+        self.reader().read_raw_selection(selection)
+    }
+
+    /// The allocated chunks of a chunked dataset (diagnostics; fails for
+    /// other layouts).
+    pub fn chunks(&self) -> Result<Vec<ChunkInfo>> {
+        self.reader().chunks()
     }
 }
 
