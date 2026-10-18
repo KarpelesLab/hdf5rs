@@ -291,7 +291,7 @@ fn verify_checksum(r: &mut ByteReader<'_>, what: &'static str) -> Result<()> {
     let covered = r.position();
     let expected = r.read_u32()?;
     let actual = metadata_checksum(r.data().get(..covered).ok_or(Error::UnexpectedEof)?);
-    if expected != actual {
+    if crate::checksum::VERIFY && expected != actual {
         return Err(Error::ChecksumMismatch {
             what,
             expected,

@@ -236,7 +236,7 @@ impl Superblock {
         let covered = r.position();
         let stored = r.read_u32()?;
         let computed = metadata_checksum(r.data().get(..covered).ok_or(Error::UnexpectedEof)?);
-        if stored != computed {
+        if crate::checksum::VERIFY && stored != computed {
             return Err(Error::ChecksumMismatch {
                 what: "superblock",
                 expected: stored,

@@ -22,6 +22,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::{Error, Result};
 
@@ -226,15 +227,37 @@ impl Filter for Deflate {
 }
 
 /// A set of filter implementations, keyed by filter id.
-#[derive(Default)]
 pub struct FilterRegistry {
     filters: BTreeMap<u16, Box<dyn Filter>>,
+    /// Unique among registries and changed by every registration, so
+    /// decoded-chunk caches can tell which registry produced an entry.
+    generation: u64,
+}
+
+/// A fresh registry generation.
+fn next_generation() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+impl Default for FilterRegistry {
+    fn default() -> Self {
+        FilterRegistry {
+            filters: BTreeMap::new(),
+            generation: next_generation(),
+        }
+    }
 }
 
 impl FilterRegistry {
     /// An empty registry.
     pub fn new() -> Self {
         FilterRegistry::default()
+    }
+
+    /// Identifies this registry's current set of filters.
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
     }
 
     /// A registry with the built-in filters: deflate (feature `deflate`),
@@ -267,6 +290,7 @@ impl FilterRegistry {
     /// same id.
     pub fn register(&mut self, filter: Box<dyn Filter>) {
         self.filters.insert(filter.id(), filter);
+        self.generation = next_generation();
     }
 
     /// The filter registered for `id`, if any.

@@ -131,6 +131,13 @@ fn mismatch<T>(dt: &Datatype, target: &str) -> Result<T> {
 enum IntPlan<'a> {
     /// Same size and signedness, full precision: plain byte swap / copy.
     Exact(ByteOrder),
+    /// Whole-byte (1, 2, 4 or 8 bytes) integer, losslessly widened.
+    Widen {
+        fp: &'a FixedPoint,
+        size: u32,
+        signed: bool,
+        big_endian: bool,
+    },
     /// Bit extraction through [`bits::decode_fixed`].
     Generic(&'a FixedPoint),
 }
@@ -163,6 +170,17 @@ fn int_plan<'a>(dt: &'a Datatype, bits: u32, signed: bool, target: &str) -> Resu
     }
     if size * 8 == bits && fp.bit_offset == 0 && p == bits && fp.signed == signed {
         Ok(IntPlan::Exact(fp.byte_order))
+    } else if fp.bit_offset == 0
+        && p == size * 8
+        && matches!(size, 1 | 2 | 4 | 8)
+        && fp.byte_order != ByteOrder::Vax
+    {
+        Ok(IntPlan::Widen {
+            fp,
+            size,
+            signed: fp.signed,
+            big_endian: fp.byte_order == ByteOrder::BigEndian,
+        })
     } else {
         Ok(IntPlan::Generic(fp))
     }
@@ -188,7 +206,9 @@ macro_rules! impl_int {
                             _ => <$t>::from_le_bytes(arr),
                         })
                     }
-                    IntPlan::Generic(fp) => int_from(bits::decode_fixed(fp, bytes)?),
+                    IntPlan::Widen { fp, .. } | IntPlan::Generic(fp) => {
+                        int_from(bits::decode_fixed(fp, bytes)?)
+                    }
                 }
             }
 
@@ -208,6 +228,39 @@ macro_rules! impl_int {
                             out.extend(chunks.iter().map(|c| <$t>::from_be_bytes(*c)));
                         } else {
                             out.extend(chunks.iter().map(|c| <$t>::from_le_bytes(*c)));
+                        }
+                    }
+                    IntPlan::Widen { size: 1, signed, .. } => {
+                        // Lossless by `int_plan`: the casts below only
+                        // sign- or zero-extend.
+                        if signed {
+                            out.extend(bytes.iter().map(|&b| b as i8 as i128 as $t));
+                        } else {
+                            out.extend(bytes.iter().map(|&b| b as i128 as $t));
+                        }
+                    }
+                    IntPlan::Widen { size, signed, big_endian, .. } => {
+                        macro_rules! widen {
+                            ($s:ty) => {{
+                                let (chunks, _) = bytes.as_chunks::<{ size_of::<$s>() }>();
+                                if big_endian {
+                                    out.extend(
+                                        chunks.iter().map(|c| <$s>::from_be_bytes(*c) as i128 as $t),
+                                    );
+                                } else {
+                                    out.extend(
+                                        chunks.iter().map(|c| <$s>::from_le_bytes(*c) as i128 as $t),
+                                    );
+                                }
+                            }};
+                        }
+                        match (size, signed) {
+                            (2, false) => widen!(u16),
+                            (2, true) => widen!(i16),
+                            (4, false) => widen!(u32),
+                            (4, true) => widen!(i32),
+                            (8, false) => widen!(u64),
+                            _ => widen!(i64),
                         }
                     }
                     IntPlan::Generic(fp) => {
@@ -751,6 +804,18 @@ pub fn decode_member<T: H5Type>(
 
 /// Decode an integer element of `dt` (integer or enumeration) as `i128`
 /// when representable (used by [`Value`] and `Display`).
+/// Like [`int_value`], but `None` instead of an error. Never formats
+/// `dt` (formatting an enumeration decodes its member values, so error
+/// messages built from nested enumerations would cost exponential time).
+pub(crate) fn int_value_opt(dt: &Datatype, bytes: &[u8]) -> Option<Int> {
+    let (fp, size) = fixed_source(dt)?;
+    bits::validate_fixed(fp, size).ok()?;
+    if bytes.len() != dt.size as usize {
+        return None;
+    }
+    bits::decode_fixed(fp, bytes).ok()
+}
+
 pub(crate) fn int_value(dt: &Datatype, bytes: &[u8]) -> Result<Int> {
     let Some((fp, size)) = fixed_source(dt) else {
         return mismatch(dt, "integer");

@@ -213,7 +213,7 @@ pub(crate) fn verify_checksum(buf: &[u8], what: &'static str) -> Result<()> {
     let (body, tail) = buf.split_at(split);
     let expected = ByteReader::new(tail).read_u32()?;
     let actual = metadata_checksum(body);
-    if expected != actual {
+    if crate::checksum::VERIFY && expected != actual {
         return Err(Error::ChecksumMismatch {
             what,
             expected,

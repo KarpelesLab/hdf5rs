@@ -1,6 +1,8 @@
 //! Compact and contiguous layouts (including external raw data files).
 
-use super::selection::{Resolved, block_runs, for_each_run, row_major_strides};
+use super::selection::{
+    DimRuns, Resolved, RunGroup, block_runs, copy_group, for_each_group, row_major_strides,
+};
 use super::{DatasetStorage, dataset_bytes};
 use crate::error::{Error, Result};
 use crate::format::UNDEFINED_ADDRESS;
@@ -14,12 +16,6 @@ use crate::io::ReadAt;
 const MAX_GAP: u64 = 16 << 10;
 /// Upper bound of one coalesced read.
 const MAX_SPAN: u64 = 4 << 20;
-
-/// Byte offset of element `n` of `esize` bytes, checked.
-pub(super) fn byte_off(n: u64, esize: usize) -> Result<u64> {
-    n.checked_mul(esize as u64)
-        .ok_or(Error::LimitExceeded("byte offset overflows"))
-}
 
 /// `u64` byte position/length to `usize`.
 pub(super) fn to_usize(v: u64) -> Result<usize> {
@@ -39,21 +35,8 @@ pub(super) fn copy_from_full(
     let Some(runs) = block_runs(sel, &origin, dims, &row_major_strides(dims)) else {
         return Ok(());
     };
-    let esize = storage.element_size;
-    for_each_run(&runs, &mut |s, o, n| {
-        let s = to_usize(byte_off(s, esize)?)?;
-        let o = to_usize(byte_off(o, esize)?)?;
-        let n = to_usize(byte_off(n, esize)?)?;
-        let from = s
-            .checked_add(n)
-            .and_then(|e| src.get(s..e))
-            .ok_or(Error::UnexpectedEof)?;
-        let to = o
-            .checked_add(n)
-            .and_then(|e| out.get_mut(o..e))
-            .ok_or_else(|| Error::invalid("selection run outside output"))?;
-        to.copy_from_slice(from);
-        Ok(())
+    for_each_group(&runs, storage.element_size, &mut |g| {
+        copy_group(src, 0, g, out)
     })
 }
 
@@ -121,50 +104,103 @@ fn read_runs(
     let Some(runs) = block_runs(sel, &origin, dims, &row_major_strides(dims)) else {
         return Ok(());
     };
-    let esize = storage.element_size;
+    read_block_runs(store, base, &runs, storage.element_size, out)
+}
+
+/// Read the runs of a row-major block of `esize`-byte elements stored at
+/// `base` in `store` into `out`, coalescing nearby runs into larger reads.
+pub(super) fn read_block_runs(
+    store: &dyn ReadAt,
+    base: u64,
+    runs: &[DimRuns],
+    esize: usize,
+    out: &mut [u8],
+) -> Result<()> {
     let mut span = Span {
         store,
         base,
         start: 0,
         end: 0,
-        pieces: Vec::new(),
+        groups: Vec::new(),
         tmp: Vec::new(),
     };
-    for_each_run(&runs, &mut |s, o, n| {
-        let s = byte_off(s, esize)?;
-        let o = to_usize(byte_off(o, esize)?)?;
-        let n = byte_off(n, esize)?;
-        span.push(s, o, n, out)
-    })?;
+    for_each_group(runs, esize, &mut |g| span.push_group(g, out))?;
     span.flush(out)
 }
 
 /// A pending coalesced read: byte range `start..end` (relative to `base`)
-/// and the pieces `(source offset, output offset, length)` it serves.
+/// and the run groups it serves.
 struct Span<'s> {
     store: &'s dyn ReadAt,
     base: u64,
     start: u64,
     end: u64,
-    pieces: Vec<(u64, usize, u64)>,
+    groups: Vec<RunGroup>,
     tmp: Vec<u8>,
 }
 
 impl Span<'_> {
-    fn push(&mut self, src: u64, out_pos: usize, len: u64, out: &mut [u8]) -> Result<()> {
-        let end = src
-            .checked_add(len)
-            .ok_or(Error::LimitExceeded("byte offset overflows"))?;
-        let mergeable = !self.pieces.is_empty()
-            && src >= self.end
-            && src - self.end <= MAX_GAP
+    /// Queue a group, split so that every queued piece is worth reading
+    /// through (small gaps) and spans at most [`MAX_SPAN`] bytes.
+    fn push_group(&mut self, g: &RunGroup, out: &mut [u8]) -> Result<()> {
+        if g.count > 1 && g.src_step.saturating_sub(g.len) > MAX_GAP {
+            // Far apart: one direct read per run.
+            self.flush(out)?;
+            let len = to_usize(g.len)?;
+            let (mut src, mut o) = (g.src, to_usize(g.out)?);
+            let (src_step, out_step) = (g.src_step, to_usize(g.out_step)?);
+            for _ in 0..g.count {
+                let dst = o
+                    .checked_add(len)
+                    .and_then(|e| out.get_mut(o..e))
+                    .ok_or_else(|| Error::invalid("selection run outside output"))?;
+                let pos = self
+                    .base
+                    .checked_add(src)
+                    .ok_or(Error::LimitExceeded("file position overflows"))?;
+                self.store.read_exact_at(pos, dst)?;
+                src = src.saturating_add(src_step);
+                o = o.saturating_add(out_step);
+            }
+            return Ok(());
+        }
+        let per = if g.count <= 1 {
+            1
+        } else {
+            (MAX_SPAN.saturating_sub(g.len) / g.src_step.max(1)).saturating_add(1)
+        };
+        let mut k = 0u64;
+        while k < g.count {
+            let n = per.min(g.count - k);
+            let at = |step: u64, from: u64| {
+                k.checked_mul(step)
+                    .and_then(|d| d.checked_add(from))
+                    .ok_or(Error::LimitExceeded("byte offset overflows"))
+            };
+            let sub = RunGroup {
+                src: at(g.src_step, g.src)?,
+                out: at(g.out_step, g.out)?,
+                count: n,
+                ..*g
+            };
+            self.push(sub, out)?;
+            k += n;
+        }
+        Ok(())
+    }
+
+    fn push(&mut self, g: RunGroup, out: &mut [u8]) -> Result<()> {
+        let (start, end) = (g.src, g.src_end()?);
+        let mergeable = !self.groups.is_empty()
+            && start >= self.end
+            && start - self.end <= MAX_GAP
             && end - self.start <= MAX_SPAN;
         if !mergeable {
             self.flush(out)?;
-            self.start = src;
+            self.start = start;
         }
         self.end = end;
-        self.pieces.push((src, out_pos, len));
+        self.groups.push(g);
         Ok(())
     }
 
@@ -174,35 +210,28 @@ impl Span<'_> {
                 .checked_add(off)
                 .ok_or(Error::LimitExceeded("file position overflows"))
         };
-        match self.pieces.as_slice() {
+        match self.groups.as_slice() {
             [] => {}
-            [(src, o, len)] => {
-                let len = to_usize(*len)?;
+            [g] if g.count == 1 => {
+                let o = to_usize(g.out)?;
+                let len = to_usize(g.len)?;
                 let dst = o
                     .checked_add(len)
-                    .and_then(|e| out.get_mut(*o..e))
+                    .and_then(|e| out.get_mut(o..e))
                     .ok_or_else(|| Error::invalid("selection run outside output"))?;
-                self.store.read_exact_at(pos(*src)?, dst)?;
+                self.store.read_exact_at(pos(g.src)?, dst)?;
             }
-            pieces => {
+            groups => {
                 let span_len = to_usize(self.end - self.start)?;
                 self.tmp.clear();
                 self.tmp.resize(span_len, 0);
                 self.store.read_exact_at(pos(self.start)?, &mut self.tmp)?;
-                for &(src, o, len) in pieces {
-                    // Pieces lie within the span by construction.
-                    let s = to_usize(src - self.start)?;
-                    let len = to_usize(len)?;
-                    let from = self.tmp.get(s..s + len).ok_or(Error::UnexpectedEof)?;
-                    let dst = o
-                        .checked_add(len)
-                        .and_then(|e| out.get_mut(o..e))
-                        .ok_or_else(|| Error::invalid("selection run outside output"))?;
-                    dst.copy_from_slice(from);
+                for g in groups {
+                    copy_group(&self.tmp, self.start, g, out)?;
                 }
             }
         }
-        self.pieces.clear();
+        self.groups.clear();
         Ok(())
     }
 }

@@ -100,6 +100,21 @@
 //! # Ok::<(), hdf5rs::Error>(())
 //! ```
 //!
+//! # Caching, performance and untrusted input
+//!
+//! Each [`Dataset`] keeps a [`ChunkCache`](read::ChunkCache) of decoded
+//! chunks (16 MiB by default, see [`FileAccess::chunk_cache_bytes`]) and
+//! its chunk index, so repeated small reads do not decompress the same
+//! chunks again. The `parallel` Cargo feature decodes the chunks of one
+//! read on several threads.
+//!
+//! Every size and count read from a file is validated before use: hostile
+//! files produce errors, not panics, hangs or unbounded allocations.
+//! [`ReadLimits`] (per file through [`FileAccess::read_limits`], or per
+//! read) bounds output and decoded chunk sizes and lists every other bound
+//! applied. The parsers are exercised by a mutation stress test and
+//! cargo-fuzz targets (`tests/stress.rs`, `fuzz/`).
+//!
 //! # Writing a file
 //!
 //! See the [`write`](mod@write) module for details and supported features.

@@ -1,20 +1,24 @@
 //! The typed read API: [`DatasetReader`], [`Array`] and element decoding
 //! with the file's global heap.
 
+use std::cell::Cell;
 use std::fmt;
 
 use crate::dataset::Dataset;
 use crate::error::{Error, Result};
 use crate::file::File;
 use crate::filters::FilterRegistry;
+use crate::format::global_heap::GlobalHeapId;
 use crate::format::messages::datatype::Datatype;
 use crate::format::messages::layout::DataLayout;
 use crate::format::vds::{SAME_FILE, VirtualMapping};
+use crate::io::ReadAt;
 use crate::read::{ChunkInfo, DatasetStorage, ExternalFileResolver, ReadLimits, Selection};
-use crate::types::{DecodeContext, GlobalHeapResolver, H5Type, Value, decode_all};
+use crate::types::{DecodeContext, GlobalHeapResolver, H5Type, Value, VlenResolver, decode_all};
 
-/// Maximum nesting of virtual datasets whose sources are virtual datasets
-/// (also stops self-referencing mappings).
+/// Default maximum nesting of virtual datasets whose sources are virtual
+/// datasets (see [`ReadLimits::max_virtual_depth`]; also stops
+/// self-referencing mappings).
 pub const MAX_VIRTUAL_DEPTH: u32 = 8;
 
 /// An n-dimensional array of decoded elements: the data in row-major order
@@ -81,14 +85,44 @@ impl<T> Array<T> {
     }
 }
 
+/// A [`VlenResolver`] that fails once more than a byte budget of global
+/// heap data has been resolved (amplification guard: many elements may
+/// point to the same large heap object).
+struct BudgetResolver<'a> {
+    inner: GlobalHeapResolver<&'a dyn ReadAt>,
+    left: Cell<usize>,
+}
+
+impl VlenResolver for BudgetResolver<'_> {
+    fn global_heap_object(&self, id: &GlobalHeapId) -> Result<Vec<u8>> {
+        let data = self.inner.global_heap_object(id)?;
+        let left = self
+            .left
+            .get()
+            .checked_sub(data.len())
+            .ok_or(Error::LimitExceeded("variable-length data size"))?;
+        self.left.set(left);
+        Ok(data)
+    }
+}
+
 /// Decode packed elements of `dt`, resolving variable-length data and
-/// region references through `file`'s global heap.
-pub(crate) fn decode_elements<T: H5Type>(file: &File, dt: &Datatype, raw: &[u8]) -> Result<Vec<T>> {
+/// region references through `file`'s global heap (at most `max_heap_bytes`
+/// of heap data in total).
+pub(crate) fn decode_elements<T: H5Type>(
+    file: &File,
+    dt: &Datatype,
+    raw: &[u8],
+    max_heap_bytes: usize,
+) -> Result<Vec<T>> {
     if raw.is_empty() {
         T::check(dt)?;
         return Ok(Vec::new());
     }
-    let resolver = GlobalHeapResolver::new(file.store().as_ref(), file.sizes());
+    let resolver = BudgetResolver {
+        inner: GlobalHeapResolver::new(file.store().as_ref(), file.sizes()),
+        left: Cell::new(max_heap_bytes),
+    };
     let ctx = DecodeContext::with_resolver(file.sizes(), &resolver);
     decode_all(dt, raw, &ctx)
 }
@@ -128,6 +162,7 @@ pub struct DatasetReader<'a> {
     registry: Option<&'a FilterRegistry>,
     limits: ReadLimits,
     resolver: Option<&'a dyn ExternalFileResolver>,
+    use_cache: bool,
 }
 
 impl fmt::Debug for DatasetReader<'_> {
@@ -137,6 +172,7 @@ impl fmt::Debug for DatasetReader<'_> {
             .field("custom_filters", &self.registry.is_some())
             .field("limits", &self.limits)
             .field("custom_resolver", &self.resolver.is_some())
+            .field("use_chunk_cache", &self.use_cache)
             .finish()
     }
 }
@@ -146,8 +182,9 @@ impl<'a> DatasetReader<'a> {
         DatasetReader {
             dataset,
             registry: None,
-            limits: ReadLimits::default(),
+            limits: dataset.file().access().limits,
             resolver: None,
+            use_cache: true,
         }
     }
 
@@ -157,9 +194,19 @@ impl<'a> DatasetReader<'a> {
         self
     }
 
-    /// Replace the resource limits (output size, decoded chunk size).
+    /// Replace the resource limits (output size, decoded chunk size); the
+    /// default comes from the file's
+    /// [`FileAccess::read_limits`](crate::FileAccess::read_limits).
     pub fn limits(mut self, limits: ReadLimits) -> Self {
         self.limits = limits;
+        self
+    }
+
+    /// Use the dataset's [`ChunkCache`](crate::read::ChunkCache) (the
+    /// default) or bypass it, e.g. for a one-off scan that should not
+    /// evict cached chunks.
+    pub fn use_chunk_cache(mut self, enabled: bool) -> Self {
+        self.use_cache = enabled;
         self
     }
 
@@ -193,7 +240,7 @@ impl<'a> DatasetReader<'a> {
         let dt = self.dataset.datatype();
         T::check(dt)?;
         let raw = self.raw(selection, 0)?;
-        decode_elements(self.dataset.file(), dt, &raw)
+        decode_elements(self.dataset.file(), dt, &raw, self.limits.max_output_bytes)
     }
 
     /// Every element with the dataset's shape.
@@ -241,6 +288,9 @@ impl<'a> DatasetReader<'a> {
         if let Some(r) = self.registry {
             storage = storage.with_registry(r);
         }
+        if self.use_cache {
+            storage = storage.with_chunk_cache(ds.chunk_cache());
+        }
         storage.chunks()
     }
 
@@ -272,9 +322,12 @@ impl<'a> DatasetReader<'a> {
         if let Some(r) = self.registry {
             storage = storage.with_registry(r);
         }
+        if self.use_cache {
+            storage = storage.with_chunk_cache(ds.chunk_cache());
+        }
         match ds.layout() {
             DataLayout::Virtual { .. } => {
-                if depth >= MAX_VIRTUAL_DEPTH {
+                if depth >= self.limits.max_virtual_depth {
                     return Err(Error::LimitExceeded("virtual dataset nesting depth"));
                 }
                 let mappings = ds.virtual_mappings()?;
@@ -320,6 +373,7 @@ impl<'a> DatasetReader<'a> {
             registry: self.registry,
             limits: self.limits,
             resolver: self.resolver,
+            use_cache: self.use_cache,
         };
         reader.raw(selection, depth + 1).map(Some)
     }

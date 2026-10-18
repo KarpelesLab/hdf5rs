@@ -57,6 +57,7 @@
 //! Both rules were verified against files written by the reference
 //! library.
 
+mod cache;
 mod chunked;
 mod contiguous;
 mod selection;
@@ -67,6 +68,7 @@ mod tests;
 
 use std::sync::OnceLock;
 
+pub use cache::{ChunkCache, ChunkCacheStats, DEFAULT_CHUNK_CACHE_BYTES};
 pub use chunked::ChunkInfo;
 pub use selection::{HyperslabDim, Selection};
 pub(crate) use selection::{Resolved, block_runs, for_each_run, row_major_strides};
@@ -88,7 +90,50 @@ pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 1 << 30;
 /// Default cap on the decoded size of one chunk: 1 GiB.
 pub const DEFAULT_MAX_CHUNK_BYTES: usize = 1 << 30;
 
-/// Resource limits applied while reading.
+/// Resource limits applied while reading data.
+///
+/// Set per file with [`FileAccess::read_limits`](crate::FileAccess::read_limits)
+/// (the default for every read of the file, attributes included) or per
+/// read with [`DatasetReader::limits`](crate::DatasetReader::limits).
+/// Exceeding a limit fails the read with [`Error::LimitExceeded`].
+///
+/// # Resource limits for untrusted files
+///
+/// hdf5rs never trusts sizes and counts read from a file. Besides these
+/// configurable limits, the following bounds always apply:
+///
+/// - **metadata** (object headers, B-tree nodes, heaps, chunk indexes, …)
+///   is only allocated after checking that it fits in the file, so
+///   metadata allocations are bounded by the file size; structures that
+///   synthesize entries without on-disk backing (unallocated index pages,
+///   implicit indexes) are capped at
+///   [`MAX_SYNTHETIC_RECORDS`](crate::format::chunk_index::MAX_SYNTHETIC_RECORDS)
+///   entries (or the file size, if larger);
+/// - **one read's output** is bounded by [`max_output_bytes`](Self::max_output_bytes),
+///   checked before allocating; the work a chunked read performs is
+///   bounded by the number of chunks the file actually holds;
+/// - **decoded chunks** and every intermediate filter output are bounded
+///   by [`max_chunk_bytes`](Self::max_chunk_bytes) (decompression-bomb
+///   protection);
+/// - **variable-length data** resolved through the global heap by one
+///   decode is bounded by [`max_output_bytes`](Self::max_output_bytes) in
+///   total (dynamic [`Value`](crate::Value)s take more memory than the raw
+///   bytes, typically a few times more);
+/// - **link resolution** follows at most
+///   [`max_link_hops`](Self::max_link_hops) soft/external links per path
+///   (file-level limits); **virtual datasets** nest at most
+///   [`max_virtual_depth`](Self::max_virtual_depth) levels; shared
+///   messages chain at most 8 levels; nested datatypes and values at most
+///   a few dozen levels; v1/v2 B-trees and fractal heaps detect cycles and
+///   bound their depth;
+/// - **object headers** are cached (at most 1024 per file); each dataset
+///   keeps a [`ChunkCache`] of at most
+///   [`FileAccess::chunk_cache_bytes`](crate::FileAccess::chunk_cache_bytes)
+///   decoded bytes plus its chunk index (bounded by the file size).
+///
+/// For untrusted input, lower `max_output_bytes` and `max_chunk_bytes` to
+/// what the application can afford, and restrict access to other files
+/// (see [`FileAccess`](crate::FileAccess)).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ReadLimits {
@@ -96,6 +141,13 @@ pub struct ReadLimits {
     pub max_output_bytes: usize,
     /// Maximum decoded size of one chunk (also bounds filter output).
     pub max_chunk_bytes: usize,
+    /// Maximum number of soft and external links followed while resolving
+    /// one path (default [`MAX_SOFT_LINK_HOPS`](crate::MAX_SOFT_LINK_HOPS);
+    /// taken from the file's limits).
+    pub max_link_hops: usize,
+    /// Maximum nesting of virtual datasets whose sources are virtual
+    /// datasets (default [`MAX_VIRTUAL_DEPTH`](crate::MAX_VIRTUAL_DEPTH)).
+    pub max_virtual_depth: u32,
 }
 
 impl ReadLimits {
@@ -112,6 +164,18 @@ impl ReadLimits {
         self.max_chunk_bytes = max_chunk_bytes;
         self
     }
+
+    /// Replace the maximum number of links followed per path.
+    pub fn max_link_hops(mut self, max_link_hops: usize) -> Self {
+        self.max_link_hops = max_link_hops;
+        self
+    }
+
+    /// Replace the maximum virtual dataset nesting.
+    pub fn max_virtual_depth(mut self, max_virtual_depth: u32) -> Self {
+        self.max_virtual_depth = max_virtual_depth;
+        self
+    }
 }
 
 impl Default for ReadLimits {
@@ -119,6 +183,8 @@ impl Default for ReadLimits {
         ReadLimits {
             max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
             max_chunk_bytes: DEFAULT_MAX_CHUNK_BYTES,
+            max_link_hops: crate::MAX_SOFT_LINK_HOPS,
+            max_virtual_depth: crate::MAX_VIRTUAL_DEPTH,
         }
     }
 }
@@ -171,6 +237,7 @@ pub struct DatasetStorage<'a> {
     resolver: Option<&'a dyn ExternalFileResolver>,
     registry: &'a FilterRegistry,
     limits: ReadLimits,
+    cache: Option<&'a ChunkCache>,
 }
 
 impl std::fmt::Debug for DatasetStorage<'_> {
@@ -186,6 +253,7 @@ impl std::fmt::Debug for DatasetStorage<'_> {
             .field("external", &self.external)
             .field("has_resolver", &self.resolver.is_some())
             .field("limits", &self.limits)
+            .field("has_chunk_cache", &self.cache.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -216,6 +284,7 @@ impl<'a> DatasetStorage<'a> {
             resolver: None,
             registry: builtin_registry(),
             limits: ReadLimits::default(),
+            cache: None,
         }
     }
 
@@ -260,6 +329,13 @@ impl<'a> DatasetStorage<'a> {
     /// Replace the resource limits.
     pub fn with_limits(mut self, limits: ReadLimits) -> Self {
         self.limits = limits;
+        self
+    }
+
+    /// Cache decoded chunks and chunk index lookups in `cache`, which must
+    /// only be used with this dataset (see [`ChunkCache`]).
+    pub fn with_chunk_cache(mut self, cache: &'a ChunkCache) -> Self {
+        self.cache = Some(cache);
         self
     }
 
@@ -372,7 +448,16 @@ pub fn read_raw(storage: &DatasetStorage<'_>, selection: &Selection) -> Result<V
 fn filled(len: usize, fill: Option<&[u8]>) -> Vec<u8> {
     match fill {
         None => vec![0; len],
-        Some(pattern) => pattern.iter().copied().cycle().take(len).collect(),
+        Some(pattern) => {
+            // Doubling copies: O(log n) memcpy calls.
+            let mut v = Vec::with_capacity(len);
+            v.extend_from_slice(&pattern[..pattern.len().min(len)]);
+            while !v.is_empty() && v.len() < len {
+                let n = v.len().min(len - v.len());
+                v.extend_from_within(..n);
+            }
+            v
+        }
     }
 }
 
@@ -383,4 +468,19 @@ fn dataset_bytes(storage: &DatasetStorage<'_>) -> Result<u64> {
         .element_count()?
         .checked_mul(storage.element_size as u64)
         .ok_or(Error::LimitExceeded("dataset size overflows"))
+}
+
+#[cfg(test)]
+mod fill_tests {
+    #[test]
+    fn filled_repeats_the_pattern() {
+        for p in [&[7u8][..], &[1, 2, 3], &[9, 8, 7, 6, 5]] {
+            for n in [0usize, 1, 2, 5, 7, 100, 1001] {
+                let len = n * p.len();
+                let want: Vec<u8> = p.iter().copied().cycle().take(len).collect();
+                assert_eq!(super::filled(len, Some(p)), want);
+            }
+        }
+        assert_eq!(super::filled(3, None), [0, 0, 0]);
+    }
 }

@@ -3,6 +3,13 @@
 //! Version 2 metadata structures are protected by Bob Jenkins' `lookup3`
 //! hash (`hashlittle`), a public-domain algorithm.
 
+/// Whether stored checksums are verified when reading.
+///
+/// Always `true`, except in builds with `--cfg fuzzing` (set automatically
+/// by `cargo fuzz`, and used by the mutation stress test) where checksum
+/// mismatches are ignored so that mutated inputs reach the deeper parsers.
+pub(crate) const VERIFY: bool = !cfg!(fuzzing);
+
 #[inline]
 fn mix(a: &mut u32, b: &mut u32, c: &mut u32) {
     *a = a.wrapping_sub(*c);

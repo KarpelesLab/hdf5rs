@@ -1,0 +1,113 @@
+# cargo-fuzz harnesses for hdf5rs (not part of the published crate, and not
+# a member of its workspace).
+#
+#   cargo install cargo-fuzz          # running needs a nightly toolchain
+#   cargo +nightly fuzz list
+#   cargo +nightly fuzz run open_walk -- -max_total_time=300 -rss_limit_mb=1024
+#
+# cargo-fuzz builds with `--cfg fuzzing`, which disables metadata checksum
+# verification in hdf5rs so that mutated inputs reach the deeper parsers.
+#
+# Seed corpus from tests/fixtures (written as fuzz/corpus/<target>/...):
+#
+#   HDF5RS_FUZZ_WRITE_CORPUS=fuzz/corpus cargo test --test stress
+#
+# The same harnesses (tests/support/{walk,parsers}.rs) run on stable Rust in
+# the mutation stress test, tests/stress.rs.
+
+[package]
+name = "hdf5rs-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+hdf5rs = { path = "..", features = ["all-filters"] }
+
+# A workspace of its own, so the parent package never pulls it in.
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "open_walk"
+path = "fuzz_targets/open_walk.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "object_header"
+path = "fuzz_targets/object_header.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "message"
+path = "fuzz_targets/message.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "datatype"
+path = "fuzz_targets/datatype.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "superblock"
+path = "fuzz_targets/superblock.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fractal_heap"
+path = "fuzz_targets/fractal_heap.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "btree_v1"
+path = "fuzz_targets/btree_v1.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "btree_v2"
+path = "fuzz_targets/btree_v2.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "chunk_index"
+path = "fuzz_targets/chunk_index.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "heaps"
+path = "fuzz_targets/heaps.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "filters"
+path = "fuzz_targets/filters.rs"
+test = false
+doc = false
+bench = false

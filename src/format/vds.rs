@@ -96,7 +96,7 @@ pub fn parse_virtual_mappings(data: &[u8], sizes: Sizes) -> Result<Vec<VirtualMa
     let end = r.position();
     let stored = r.read_u32()?;
     let computed = lookup3(data.get(..end).ok_or(Error::UnexpectedEof)?, 0);
-    if stored != computed {
+    if crate::checksum::VERIFY && stored != computed {
         return Err(Error::ChecksumMismatch {
             what: "virtual dataset global heap block",
             expected: stored,

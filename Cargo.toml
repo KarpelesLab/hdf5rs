@@ -9,7 +9,7 @@ repository = "https://github.com/KarpelesLab/hdf5rs"
 readme = "README.md"
 keywords = ["hdf5", "scientific", "file-format", "pure-rust"]
 categories = ["encoding", "parser-implementations", "science"]
-exclude = ["/.github", "/tests/fixtures", "/tools"]
+exclude = ["/.github", "/tests/fixtures", "/tests/regressions", "/tools", "/fuzz"]
 
 [dependencies]
 compcol = { version = "0.7.2", default-features = false, features = ["alloc", "zlib"], optional = true }
@@ -31,5 +31,12 @@ bzip2 = ["dep:compcol", "compcol/bzip2"]
 blosc = ["dep:compcol", "compcol/lz4", "compcol/zstd", "compcol/snappy"]
 # Bitshuffle filter (id 32008), optionally with lz4 or zstd, via `compcol`.
 bitshuffle = ["dep:compcol", "compcol/lz4", "compcol/zstd"]
+# Decode the chunks of one read on several threads (std::thread::scope).
+parallel = []
 # Every optional filter.
 all-filters = ["deflate", "zstd", "lz4", "bzip2", "blosc", "bitshuffle"]
+
+[lints.rust]
+# `cfg(fuzzing)` is set by cargo-fuzz (and the stress test's checksum-free
+# mode); it disables metadata checksum verification.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }

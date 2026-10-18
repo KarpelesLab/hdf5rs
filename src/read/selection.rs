@@ -465,9 +465,293 @@ pub(crate) fn for_each_run(
     }
 }
 
+/// `count` equally spaced runs of `len` bytes: run `k` copies source bytes
+/// `src + k * src_step ..` to output bytes `out + k * out_step ..`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RunGroup {
+    pub src: u64,
+    pub out: u64,
+    pub len: u64,
+    pub count: u64,
+    pub src_step: u64,
+    pub out_step: u64,
+}
+
+impl RunGroup {
+    /// One past the last source byte.
+    pub fn src_end(&self) -> Result<u64> {
+        (self.count.saturating_sub(1))
+            .checked_mul(self.src_step)
+            .and_then(|v| v.checked_add(self.src))
+            .and_then(|v| v.checked_add(self.len))
+            .ok_or(Error::LimitExceeded("byte offset overflows"))
+    }
+}
+
+/// Like [`for_each_run`], but in bytes (elements of `esize` bytes) and
+/// with equally spaced runs of the last dimension grouped, so strided
+/// selections cost one callback per group rather than per element.
+pub(crate) fn for_each_group(
+    dims: &[DimRuns],
+    esize: usize,
+    f: &mut dyn FnMut(&RunGroup) -> Result<()>,
+) -> Result<()> {
+    let es = esize as u64;
+    let bytes = |v: u64| {
+        v.checked_mul(es)
+            .ok_or(Error::LimitExceeded("byte offset overflows"))
+    };
+    let Some((last, outer)) = dims.split_last() else {
+        return f(&RunGroup {
+            src: 0,
+            out: 0,
+            len: es,
+            count: 1,
+            src_step: 0,
+            out_step: 0,
+        });
+    };
+    // Group the last dimension's pieces (relative byte offsets).
+    let mut groups: Vec<RunGroup> = Vec::new();
+    for p in &last.pieces {
+        let src = bytes(p.src.saturating_mul(last.src_stride))?;
+        let out = bytes(p.out.saturating_mul(last.out_stride))?;
+        let len = bytes(p.len)?;
+        if let Some(g) = groups.last_mut()
+            && g.len == len
+            && src > g.src
+            && out > g.out
+        {
+            let (ds, dout) = (src - g.src, out - g.out);
+            if g.count == 1 {
+                g.src_step = ds;
+                g.out_step = dout;
+                g.count = 2;
+                continue;
+            }
+            if g.count.checked_mul(g.src_step) == Some(ds)
+                && g.count.checked_mul(g.out_step) == Some(dout)
+            {
+                g.count += 1;
+                continue;
+            }
+        }
+        groups.push(RunGroup {
+            src,
+            out,
+            len,
+            count: 1,
+            src_step: 0,
+            out_step: 0,
+        });
+    }
+    if outer
+        .iter()
+        .any(|d| d.pieces.is_empty() || d.pieces.iter().any(|p| p.len == 0))
+    {
+        return Ok(());
+    }
+    // One element run per row (e.g. a column): group along the next
+    // dimension instead.
+    let mut outer = outer;
+    if let [g] = groups.as_slice()
+        && g.count == 1
+        && let Some((next, rest)) = outer.split_last()
+    {
+        let g = *g;
+        let add = |a: u64, b: u64| {
+            a.checked_add(b)
+                .ok_or(Error::LimitExceeded("byte offset overflows"))
+        };
+        groups = next
+            .pieces
+            .iter()
+            .map(|p| {
+                Ok(RunGroup {
+                    src: add(bytes(p.src.saturating_mul(next.src_stride))?, g.src)?,
+                    out: add(bytes(p.out.saturating_mul(next.out_stride))?, g.out)?,
+                    len: g.len,
+                    count: p.len,
+                    src_step: bytes(next.src_stride)?,
+                    out_step: bytes(next.out_stride)?,
+                })
+            })
+            .collect::<Result<_>>()?;
+        outer = rest;
+    }
+    let mut idx = vec![(0usize, 0u64); outer.len()];
+    loop {
+        let mut src = 0u64;
+        let mut out = 0u64;
+        for (d, &(i, w)) in outer.iter().zip(&idx) {
+            let p = d.pieces[i];
+            src = src.saturating_add(p.src.saturating_add(w).saturating_mul(d.src_stride));
+            out = out.saturating_add(p.out.saturating_add(w).saturating_mul(d.out_stride));
+        }
+        let (src, out) = (bytes(src)?, bytes(out)?);
+        for g in &groups {
+            let shifted = RunGroup {
+                src: src
+                    .checked_add(g.src)
+                    .ok_or(Error::LimitExceeded("byte offset overflows"))?,
+                out: out
+                    .checked_add(g.out)
+                    .ok_or(Error::LimitExceeded("byte offset overflows"))?,
+                ..*g
+            };
+            f(&shifted)?;
+        }
+        let mut k = outer.len();
+        loop {
+            if k == 0 {
+                return Ok(());
+            }
+            k -= 1;
+            let (i, w) = &mut idx[k];
+            *w += 1;
+            if *w < outer[k].pieces[*i].len {
+                break;
+            }
+            *w = 0;
+            *i += 1;
+            if *i < outer[k].pieces.len() {
+                break;
+            }
+            *i = 0;
+        }
+    }
+}
+
+/// Copy the runs of `g` from `src` (whose first byte is source offset
+/// `src_base`) into `out`.
+pub(crate) fn copy_group(src: &[u8], src_base: u64, g: &RunGroup, out: &mut [u8]) -> Result<()> {
+    let usz =
+        |v: u64| usize::try_from(v).map_err(|_| Error::LimitExceeded("size exceeds address space"));
+    let start = usz(g.src.checked_sub(src_base).ok_or(Error::UnexpectedEof)?)?;
+    let (len, ss, os) = (usz(g.len)?, usz(g.src_step)?, usz(g.out_step)?);
+    let o = usz(g.out)?;
+    match len {
+        1 => copy_fixed::<1>(src, out, start, o, ss, os, g.count),
+        2 => copy_fixed::<2>(src, out, start, o, ss, os, g.count),
+        4 => copy_fixed::<4>(src, out, start, o, ss, os, g.count),
+        8 => copy_fixed::<8>(src, out, start, o, ss, os, g.count),
+        _ => {
+            let (mut s, mut o) = (start, o);
+            for _ in 0..g.count {
+                let from = s
+                    .checked_add(len)
+                    .and_then(|e| src.get(s..e))
+                    .ok_or(Error::UnexpectedEof)?;
+                let to = o
+                    .checked_add(len)
+                    .and_then(|e| out.get_mut(o..e))
+                    .ok_or_else(|| Error::invalid("selection run outside output"))?;
+                to.copy_from_slice(from);
+                s = s.saturating_add(ss);
+                o = o.saturating_add(os);
+            }
+            Ok(())
+        }
+    }
+}
+
+/// [`copy_group`] for runs of exactly `N` bytes.
+fn copy_fixed<const N: usize>(
+    src: &[u8],
+    out: &mut [u8],
+    mut s: usize,
+    mut o: usize,
+    ss: usize,
+    os: usize,
+    count: u64,
+) -> Result<()> {
+    for _ in 0..count {
+        let from: &[u8; N] = s
+            .checked_add(N)
+            .and_then(|e| src.get(s..e))
+            .and_then(|b| b.try_into().ok())
+            .ok_or(Error::UnexpectedEof)?;
+        let to: &mut [u8; N] = o
+            .checked_add(N)
+            .and_then(|e| out.get_mut(o..e))
+            .and_then(|b| b.try_into().ok())
+            .ok_or_else(|| Error::invalid("selection run outside output"))?;
+        *to = *from;
+        s = s.saturating_add(ss);
+        o = o.saturating_add(os);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn groups_match_runs() {
+        let space = Dataspace {
+            version: 2,
+            kind: DataspaceKind::Simple,
+            dims: vec![7, 9, 11],
+            max_dims: None,
+            permutation: None,
+        };
+        let sels = [
+            Selection::All,
+            Selection::hyperslab(vec![
+                HyperslabDim::new(1, 2, 3, 1),
+                HyperslabDim::new(0, 3, 3, 2),
+                HyperslabDim::new(1, 3, 3, 1),
+            ]),
+            Selection::from_ranges(&[2..5, 0..9, 4..5]),
+            Selection::hyperslab(vec![
+                HyperslabDim::range(0..7),
+                HyperslabDim::new(0, 4, 3, 1),
+                HyperslabDim::new(0, 2, 6, 1),
+            ]),
+        ];
+        for sel in sels {
+            let r = sel.resolve(&space).unwrap();
+            for (origin, extent) in [([0, 0, 0], [7, 9, 11]), ([2, 3, 4], [4, 4, 4])] {
+                let strides = row_major_strides(&extent);
+                let Some(runs) = block_runs(&r, &origin, &extent, &strides) else {
+                    continue;
+                };
+                for esize in [1usize, 3, 8] {
+                    let mut want = Vec::new();
+                    for_each_run(&runs, &mut |s, o, n| {
+                        for k in 0..n {
+                            want.push(((s + k) * esize as u64, (o + k) * esize as u64));
+                        }
+                        Ok(())
+                    })
+                    .unwrap();
+                    let mut got = Vec::new();
+                    for_each_group(&runs, esize, &mut |g| {
+                        for k in 0..g.count {
+                            for b in (0..g.len).step_by(esize) {
+                                got.push((g.src + k * g.src_step + b, g.out + k * g.out_step + b));
+                            }
+                        }
+                        Ok(())
+                    })
+                    .unwrap();
+                    assert_eq!(got, want, "{sel:?} {origin:?} esize {esize}");
+                    // And the copies agree.
+                    let n: u64 = extent.iter().product();
+                    let src: Vec<u8> = (0..n as usize * esize).map(|i| i as u8).collect();
+                    let mut a = vec![0u8; r.count as usize * esize];
+                    let mut b = a.clone();
+                    for (s, o) in &want {
+                        let (s, o) = (*s as usize, *o as usize);
+                        a[o..o + esize].copy_from_slice(&src[s..s + esize]);
+                    }
+                    for_each_group(&runs, esize, &mut |g| copy_group(&src, 0, g, &mut b)).unwrap();
+                    assert_eq!(a, b);
+                }
+            }
+        }
+    }
 
     fn simple(dims: &[u64]) -> Dataspace {
         Dataspace {

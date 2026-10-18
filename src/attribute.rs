@@ -90,7 +90,8 @@ impl Attribute {
     /// Decode every element into `T`, in row-major order (variable-length
     /// data and region references are resolved through the file).
     pub fn read<T: H5Type>(&self) -> Result<Vec<T>> {
-        decode_elements(&self.file, &self.datatype, &self.data)
+        let budget = self.file.access().limits.max_output_bytes;
+        decode_elements(&self.file, &self.datatype, &self.data, budget)
     }
 
     /// Decode every element together with the attribute's shape.

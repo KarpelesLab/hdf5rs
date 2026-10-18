@@ -526,7 +526,7 @@ fn verify_v2_chunk<'a>(block: &'a [u8], what: &'static str) -> Result<&'a [u8]> 
     let mut sr = ByteReader::new(sum);
     let expected = sr.read_u32()?;
     let actual = metadata_checksum(body);
-    if expected != actual {
+    if crate::checksum::VERIFY && expected != actual {
         return Err(Error::ChecksumMismatch {
             what,
             expected,

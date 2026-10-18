@@ -65,3 +65,71 @@ jobs:
         run: |
           cargo build --examples
           python tools/check_modified.py --bin target/debug/examples
+
+  stress:
+    name: stress (mutated fixtures, stable)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # A different (but reproducible) seed on every run; failing inputs
+      # are saved for download.
+      - name: checksums verified
+        run: cargo test --release --all-features --test stress
+        env:
+          HDF5RS_FUZZ_ITERS: "150000"
+          HDF5RS_FUZZ_SEED: ${{ github.run_number }}
+          HDF5RS_FUZZ_DUMP: ${{ runner.temp }}/stress
+      - name: checksums ignored (as under cargo-fuzz)
+        run: cargo test --release --all-features --test stress
+        env:
+          RUSTFLAGS: -D warnings --cfg fuzzing
+          HDF5RS_FUZZ_ITERS: "150000"
+          HDF5RS_FUZZ_SEED: ${{ github.run_number }}
+          HDF5RS_FUZZ_DUMP: ${{ runner.temp }}/stress
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: stress-failures
+          path: ${{ runner.temp }}/stress
+
+  fuzz:
+    name: fuzz (libFuzzer, time-boxed)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: seed corpus from the fixtures
+        run: cargo test --release --test stress
+        env:
+          HDF5RS_FUZZ_WRITE_CORPUS: ${{ github.workspace }}/fuzz/corpus
+      # cargo-fuzz's instrumentation flags (sanitizer coverage works on
+      # stable; no address sanitizer, which safe Rust does not need).
+      - name: build fuzz targets
+        working-directory: fuzz
+        run: cargo build --release --target x86_64-unknown-linux-gnu
+        env:
+          RUSTFLAGS: >-
+            --cfg fuzzing -Cdebug-assertions -Coverflow-checks
+            -Cpasses=sancov-module
+            -Cllvm-args=-sanitizer-coverage-level=4
+            -Cllvm-args=-sanitizer-coverage-inline-8bit-counters
+            -Cllvm-args=-sanitizer-coverage-pc-table
+            -Cllvm-args=-sanitizer-coverage-trace-compares
+      - name: run every target for 30 s
+        working-directory: fuzz
+        run: |
+          set -e
+          mkdir -p artifacts
+          for t in $(ls fuzz_targets | sed 's/\.rs$//'); do
+            echo "::group::$t"
+            ./target/x86_64-unknown-linux-gnu/release/$t corpus/$t \
+              -max_total_time=30 -rss_limit_mb=2048 -malloc_limit_mb=1024 \
+              -timeout=20 -max_len=262144 -artifact_prefix=artifacts/$t-
+            echo "::endgroup::"
+          done
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts

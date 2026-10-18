@@ -18,7 +18,8 @@ use crate::format::{ScratchPad, UNDEFINED_ADDRESS};
 use crate::link::{Link, LinkEntry, LinkStorage};
 use crate::object::{Node, Object, object_common};
 
-/// Maximum number of soft links followed while resolving one path.
+/// Default maximum number of soft and external links followed while
+/// resolving one path (see [`ReadLimits::max_link_hops`](crate::read::ReadLimits::max_link_hops)).
 pub const MAX_SOFT_LINK_HOPS: usize = 40;
 
 /// A group: a collection of named links.
@@ -146,7 +147,8 @@ impl Group {
 
     /// The object at `path`, relative to this group (or absolute when it
     /// starts with `/`). Soft links are followed (up to
-    /// [`MAX_SOFT_LINK_HOPS`], external links included); external links
+    /// [`ReadLimits::max_link_hops`](crate::read::ReadLimits::max_link_hops),
+    /// external links included); external links
     /// fail with [`Error::Unsupported`] unless the file was opened with
     /// [`FileAccess::follow_external_links`](crate::FileAccess::follow_external_links)
     /// (see also [`follow_external`](Self::follow_external)).
@@ -222,7 +224,7 @@ impl Group {
 
     fn resolve_external(&self, file: &str, path: &str, hops: &mut usize) -> Result<Object> {
         *hops += 1;
-        if *hops > MAX_SOFT_LINK_HOPS {
+        if *hops > self.node.file.access().limits.max_link_hops {
             return Err(Error::LimitExceeded("soft/external link hops"));
         }
         let target = self.node.file.open_related(file)?;
@@ -258,7 +260,7 @@ impl Group {
                     .object_at(address, &group.child_path(comp))?,
                 Link::Soft { path: target } => {
                     *hops += 1;
-                    if *hops > MAX_SOFT_LINK_HOPS {
+                    if *hops > group.node.file.access().limits.max_link_hops {
                         return Err(Error::LimitExceeded("soft link hops"));
                     }
                     // Report the object under the path it was reached by.

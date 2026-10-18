@@ -17,7 +17,7 @@ use crate::format::messages::layout::DataLayout;
 use crate::format::object_header::RawMessage;
 use crate::format::vds::{VirtualMapping, parse_virtual_mappings};
 use crate::object::{Node, object_common};
-use crate::read::{ChunkInfo, Selection};
+use crate::read::{ChunkCache, ChunkInfo, Selection};
 use crate::reader::{Array, DatasetReader};
 use crate::types::{GlobalHeapResolver, H5Type, Value, VlenResolver};
 
@@ -45,6 +45,8 @@ struct Meta {
     fill_value_old: Option<OldFillValue>,
     external_files: Option<Vec<ExternalFile>>,
     external_message: Option<ExternalFiles>,
+    /// Decoded chunks and chunk index (shared by clones).
+    cache: ChunkCache,
 }
 
 /// A dataset: a multidimensional array of elements of one datatype.
@@ -131,6 +133,7 @@ impl Dataset {
             fill_value_old,
             external_files,
             external_message,
+            cache: ChunkCache::new(file.access().chunk_cache_bytes),
         };
         Ok(Dataset {
             node,
@@ -256,6 +259,14 @@ impl Dataset {
     /// The parsed External Data Files message, if any.
     pub fn external_files_message(&self) -> Option<&ExternalFiles> {
         self.meta.external_message.as_ref()
+    }
+
+    /// This dataset's cache of decoded chunks and chunk index lookups
+    /// (shared by clones of this handle; sized by
+    /// [`FileAccess::chunk_cache_bytes`](crate::FileAccess::chunk_cache_bytes),
+    /// adjustable with [`ChunkCache::set_capacity`]).
+    pub fn chunk_cache(&self) -> &ChunkCache {
+        &self.meta.cache
     }
 
     /// The mappings of a virtual dataset (empty for other layouts).

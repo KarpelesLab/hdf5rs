@@ -18,7 +18,7 @@ use crate::format::{Sizes, UNDEFINED_ADDRESS};
 use crate::group::Group;
 use crate::io::ReadAt;
 use crate::object::Object;
-use crate::read::ExternalFileResolver;
+use crate::read::{DEFAULT_CHUNK_CACHE_BYTES, ExternalFileResolver, ReadLimits};
 
 /// A thread-safe, shareable byte store.
 pub type SharedStore = Arc<dyn ReadAt + Send + Sync>;
@@ -52,6 +52,26 @@ const MAX_SHARED_DEPTH: u32 = 8;
 /// (`external_files(false)`) or confine names to the file's directory and
 /// its subdirectories (`confine_to_directory(true)`, which rejects absolute
 /// names and `..` components; symbolic links are still followed).
+///
+/// # Resource limits
+///
+/// [`read_limits`](Self::read_limits) sets the default [`ReadLimits`] of
+/// every read of the file (datasets and attributes); see [`ReadLimits`]
+/// for the complete list of bounds applied to untrusted input.
+/// [`chunk_cache_bytes`](Self::chunk_cache_bytes) sizes each dataset's
+/// decoded-chunk cache.
+///
+/// ```
+/// use hdf5rs::FileAccess;
+/// use hdf5rs::read::ReadLimits;
+///
+/// // Settings for files from an untrusted source.
+/// let access = FileAccess::default()
+///     .external_files(false)
+///     .read_limits(ReadLimits::with_max_output(64 << 20).max_chunk_bytes(16 << 20))
+///     .chunk_cache_bytes(4 << 20);
+/// # let _ = access;
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct FileAccess {
@@ -61,6 +81,11 @@ pub struct FileAccess {
     pub confine_to_directory: bool,
     /// Follow external links during path resolution (default `false`).
     pub follow_external_links: bool,
+    /// Default limits of every read (default [`ReadLimits::default`]).
+    pub limits: ReadLimits,
+    /// Capacity in bytes of each dataset's decoded-chunk cache (default
+    /// [`DEFAULT_CHUNK_CACHE_BYTES`]; 0 disables caching).
+    pub chunk_cache_bytes: usize,
 }
 
 impl Default for FileAccess {
@@ -69,6 +94,8 @@ impl Default for FileAccess {
             external_files: true,
             confine_to_directory: false,
             follow_external_links: false,
+            limits: ReadLimits::default(),
+            chunk_cache_bytes: DEFAULT_CHUNK_CACHE_BYTES,
         }
     }
 }
@@ -89,6 +116,19 @@ impl FileAccess {
     /// Follow external links automatically when resolving paths.
     pub fn follow_external_links(mut self, follow: bool) -> Self {
         self.follow_external_links = follow;
+        self
+    }
+
+    /// Set the default limits of every read of the file.
+    pub fn read_limits(mut self, limits: ReadLimits) -> Self {
+        self.limits = limits;
+        self
+    }
+
+    /// Set the capacity of each dataset's decoded-chunk cache (0 disables
+    /// it).
+    pub fn chunk_cache_bytes(mut self, bytes: usize) -> Self {
+        self.chunk_cache_bytes = bytes;
         self
     }
 }
@@ -142,12 +182,28 @@ impl File {
 
     /// Open an HDF5 file held in memory.
     pub fn from_bytes(data: Vec<u8>) -> Result<File> {
-        Self::with_store(Arc::new(data), None, FileAccess::default())
+        Self::from_bytes_with(data, FileAccess::default())
+    }
+
+    /// Open an HDF5 file held in memory with the given access policy and
+    /// limits (other files can never be opened from such a file).
+    pub fn from_bytes_with(data: Vec<u8>, access: FileAccess) -> Result<File> {
+        Self::with_store(Arc::new(data), None, access)
     }
 
     /// Open an HDF5 file from any positional reader.
     pub fn from_reader<R: ReadAt + Send + Sync + 'static>(reader: R) -> Result<File> {
-        Self::with_store(Arc::new(reader), None, FileAccess::default())
+        Self::from_reader_with(reader, FileAccess::default())
+    }
+
+    /// Open an HDF5 file from any positional reader with the given access
+    /// policy and limits (other files can never be opened from such a
+    /// file).
+    pub fn from_reader_with<R: ReadAt + Send + Sync + 'static>(
+        reader: R,
+        access: FileAccess,
+    ) -> Result<File> {
+        Self::with_store(Arc::new(reader), None, access)
     }
 
     /// The policy for accessing other files.

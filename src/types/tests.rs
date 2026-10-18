@@ -1570,3 +1570,56 @@ fn selection_conversion() {
     enc.extend([0xaa; 4]);
     assert_eq!(Selection::parse_prefix(&enc).unwrap(), (Selection::All, 16));
 }
+
+#[test]
+fn widening_bulk_path_matches_per_element() {
+    let ctx = DecodeContext::default();
+    let bytes: Vec<u8> = (0..64u32).map(|i| (i * 37 + 0x80) as u8).collect();
+    for size in [1u32, 2, 4] {
+        for signed in [false, true] {
+            for order in [LE, BE] {
+                let dt = int(size, signed, order);
+                let one = |c: &[u8]| i64::decode(&dt, c, &ctx).unwrap();
+                let expect: Vec<i64> = bytes.chunks_exact(size as usize).map(one).collect();
+                assert_eq!(decode_all::<i64>(&dt, &bytes, &ctx).unwrap(), expect);
+                if !signed {
+                    let expect: Vec<u64> = expect.iter().map(|&v| v as u64).collect();
+                    assert_eq!(decode_all::<u64>(&dt, &bytes, &ctx).unwrap(), expect);
+                } else {
+                    assert!(decode_all::<u64>(&dt, &bytes, &ctx).is_err());
+                }
+            }
+        }
+    }
+    // Spot values: sign extension and byte order.
+    let dt = int(2, true, BE);
+    assert_eq!(
+        decode_all::<i32>(&dt, &[0xff, 0xfe, 0x01, 0x00], &ctx).unwrap(),
+        [-2, 256]
+    );
+    let dt = int(1, true, LE);
+    assert_eq!(
+        decode_all::<i16>(&dt, &[0x80, 0x7f], &ctx).unwrap(),
+        [-128, 127]
+    );
+    let dt = int(4, false, LE);
+    assert_eq!(
+        decode_all::<i64>(&dt, &[0xff; 4], &ctx).unwrap(),
+        [u32::MAX as i64]
+    );
+}
+
+#[test]
+fn nested_enumerations_format_in_linear_time() {
+    // enum of enum of ... of i8: formatting used to build error messages
+    // that formatted the nested type again, exponentially (found by
+    // fuzzing).
+    let mut dt = int(1, true, LE);
+    for _ in 0..30 {
+        dt = enumeration(dt, &[("A", 0), ("B", 1), ("C", 2)]);
+    }
+    let s = dt.to_string();
+    assert!(s.len() < 10_000, "{}", s.len());
+    let ctx = DecodeContext::default();
+    let _ = decode_all::<Value>(&dt, &[1, 2, 0], &ctx);
+}

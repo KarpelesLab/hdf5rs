@@ -69,13 +69,48 @@ pub fn unshuffle(data: Vec<u8>, elem_size: usize) -> Vec<u8> {
     let body = n * elem_size;
     let mut out = vec![0u8; data.len()];
     let (out_body, out_tail) = out.split_at_mut(body);
+    let done = match elem_size {
+        2 => unshuffle2(&data[..body], n, out_body),
+        4 => unshuffle_planes::<4>(&data[..body], n, out_body),
+        8 => unshuffle_planes::<8>(&data[..body], n, out_body),
+        _ => 0,
+    };
+    // Elements not handled by the tiled fast path.
     for (b, plane) in data[..body].chunks_exact(n).enumerate() {
-        for (elem, &v) in out_body.chunks_exact_mut(elem_size).zip(plane) {
+        let elems = out_body.chunks_exact_mut(elem_size).skip(done);
+        for (elem, &v) in elems.zip(plane.get(done..).unwrap_or(&[])) {
             elem[b] = v;
         }
     }
     out_tail.copy_from_slice(&data[body..]);
     out
+}
+
+/// Unshuffle 2-byte elements from the two planes of `n` bytes in `src`;
+/// returns the number of elements done.
+fn unshuffle2(src: &[u8], n: usize, out: &mut [u8]) -> usize {
+    let (Some(lo), Some(hi)) = (src.get(..n), src.get(n..2 * n)) else {
+        return 0;
+    };
+    let (elems, _) = out.as_chunks_mut::<2>();
+    for ((e, &a), &b) in elems.iter_mut().zip(lo).zip(hi) {
+        *e = [a, b];
+    }
+    elems.len().min(n)
+}
+
+/// Unshuffle every element of `N` bytes plane by plane (sequential reads,
+/// fixed-stride writes); returns the number of elements done.
+fn unshuffle_planes<const N: usize>(src: &[u8], n: usize, out: &mut [u8]) -> usize {
+    let (elems, _) = out.as_chunks_mut::<N>();
+    let n = n.min(elems.len());
+    for b in 0..N {
+        let plane = src.get(b * n..(b + 1) * n).unwrap_or(&[]);
+        for (e, &v) in elems.iter_mut().zip(plane) {
+            e[b] = v;
+        }
+    }
+    n
 }
 
 #[cfg(test)]
@@ -95,9 +130,19 @@ mod tests {
 
     #[test]
     fn roundtrip_many_sizes() {
-        let data: Vec<u8> = (0..1000u32).map(|i| (i * 7 + i / 13) as u8).collect();
+        let data: Vec<u8> = (0..8192u32).map(|i| (i * 7 + i / 13) as u8).collect();
+        // The fixed-size kernels agree with the definition.
+        for es in [2usize, 4, 8] {
+            let n = data.len() / es;
+            let s = shuffle(data.clone(), es);
+            for i in 0..n {
+                for b in 0..es {
+                    assert_eq!(s[b * n + i], data[i * es + b]);
+                }
+            }
+        }
         for es in 0..=20 {
-            for len in [0, 1, 2, 5, 17, 64, 999, 1000] {
+            for len in [0, 1, 2, 5, 17, 64, 999, 1000, 4099, 8192] {
                 let d = data[..len].to_vec();
                 let s = shuffle(d.clone(), es);
                 assert_eq!(s.len(), d.len());

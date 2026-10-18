@@ -158,7 +158,7 @@ impl FractalHeapHeader {
         let end = r.position();
         let actual = metadata_checksum(data.get(..end).ok_or(Error::UnexpectedEof)?);
         let expected = r.read_u32()?;
-        if expected != actual {
+        if crate::checksum::VERIFY && expected != actual {
             return Err(Error::ChecksumMismatch {
                 what: "fractal heap header",
                 expected,
@@ -731,7 +731,7 @@ impl FractalHeap {
         let end = r.position();
         let actual = metadata_checksum(buf.get(..end).ok_or(Error::UnexpectedEof)?);
         let expected = r.read_u32()?;
-        if expected != actual {
+        if crate::checksum::VERIFY && expected != actual {
             return Err(Error::ChecksumMismatch {
                 what: "fractal heap indirect block",
                 expected,
@@ -824,7 +824,7 @@ impl FractalHeap {
             let mut copy = data.clone();
             copy[pos..pos + 4].fill(0);
             let actual = metadata_checksum(&copy);
-            if stored != actual {
+            if crate::checksum::VERIFY && stored != actual {
                 return Err(Error::ChecksumMismatch {
                     what: "fractal heap direct block",
                     expected: stored,

@@ -4,7 +4,7 @@ use std::fmt;
 
 use super::DecodeContext;
 use super::bits::{self, Int};
-use super::h5type::{array_parts, int_value, member_type, string_bytes};
+use super::h5type::{array_parts, int_value, int_value_opt, member_type, string_bytes};
 use super::reference::{Reference, decode_reference};
 use super::vlen::fetch_vlen;
 use crate::error::{Error, Result};
@@ -312,7 +312,7 @@ fn decode_array(
 }
 
 fn enum_member_value(base: &Datatype, raw: &[u8]) -> Option<i128> {
-    int_value(base, raw).ok()?.to_i128()
+    int_value_opt(base, raw)?.to_i128()
 }
 
 fn string_value(b: Vec<u8>) -> Value {

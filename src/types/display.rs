@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-use super::h5type::int_value;
+use super::h5type::int_value_opt;
 use crate::format::messages::datatype::{
     ByteOrder, CharacterSet, ComplexForm, Datatype, DatatypeClass, ReferenceKind, StringPadding,
     VariableLengthKind,
@@ -115,7 +115,7 @@ impl fmt::Display for Datatype {
                     if i > 0 {
                         f.write_str(", ")?;
                     }
-                    match int_value(base, &m.value).ok().and_then(|v| v.to_i128()) {
+                    match int_value_opt(base, &m.value).and_then(|v| v.to_i128()) {
                         Some(v) => write!(f, "{} = {v}", m.name)?,
                         None => write!(f, "{} = ?", m.name)?,
                     }

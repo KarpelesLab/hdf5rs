@@ -54,7 +54,7 @@ impl Filter for Fletcher32 {
         let actual = checksum(&input[..body]);
         let le = u32::from_le_bytes(stored);
         let be = u32::from_be_bytes(stored);
-        if !equivalent(le, actual) && !equivalent(be, actual) {
+        if crate::checksum::VERIFY && !equivalent(le, actual) && !equivalent(be, actual) {
             return Err(Error::ChecksumMismatch {
                 what: "fletcher32 filter",
                 expected: le,
