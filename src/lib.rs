@@ -15,6 +15,7 @@
 
 pub mod checksum;
 mod error;
+pub mod filters;
 pub mod format;
 pub mod io;
 
