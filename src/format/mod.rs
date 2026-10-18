@@ -7,6 +7,7 @@ pub mod btree_v1;
 pub mod global_heap;
 pub mod group_v1;
 pub mod local_heap;
+pub mod messages;
 mod reader;
 mod symbol_table_entry;
 pub mod symbol_table_node;
