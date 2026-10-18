@@ -43,9 +43,9 @@ impl SharedMessage {
                     // Reserved: 2 bytes + 4 bytes.
                     r.skip(6)?;
                 }
-                // The spec only lists type 0, but libhdf5 writes 2 ("in an
-                // object header", as in version 3) for committed datatypes
-                // (observed in h5py-generated files).
+                // The spec documents type 0 for versions 1 and 2, but files
+                // written by the reference library use 2 ("committed in an
+                // object header", as in version 3); accept both.
                 if kind != 0 && kind != 2 {
                     return Err(Error::invalid(format!(
                         "shared message v{version} with unknown type {kind}"
@@ -108,6 +108,12 @@ mod tests {
         assert!(SharedMessage::parse(&[4, 0, 0, 0], Sizes::DEFAULT).is_err());
         assert!(SharedMessage::parse(&[3, 9], Sizes::DEFAULT).is_err());
         assert!(SharedMessage::parse(&[2, 1, 0, 0, 0, 0, 0, 0, 0, 0], Sizes::DEFAULT).is_err());
+        assert_eq!(
+            SharedMessage::parse(&[2, 2, 9, 0, 0, 0, 0, 0, 0, 0], Sizes::DEFAULT)
+                .unwrap()
+                .location,
+            SharedLocation::ObjectHeader(9)
+        );
         assert!(SharedMessage::parse(&[1, 0, 0, 0, 0, 0, 0], Sizes::DEFAULT).is_err());
     }
 }

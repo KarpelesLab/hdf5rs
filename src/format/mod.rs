@@ -15,6 +15,7 @@ pub mod local_heap;
 pub mod messages;
 pub mod object_header;
 mod reader;
+pub mod sohm;
 pub mod superblock;
 mod symbol_table_entry;
 pub mod symbol_table_node;

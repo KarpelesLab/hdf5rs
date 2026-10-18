@@ -33,6 +33,9 @@ pub enum Error {
     LimitExceeded(&'static str),
     /// A named object, link or attribute does not exist.
     NotFound(String),
+    /// An object exists but is not of the requested kind (e.g. a dataset
+    /// was requested and a group was found).
+    WrongObjectType(String),
 }
 
 impl Error {
@@ -64,6 +67,7 @@ impl fmt::Display for Error {
             ),
             Error::LimitExceeded(what) => write!(f, "limit exceeded: {what}"),
             Error::NotFound(name) => write!(f, "not found: {name}"),
+            Error::WrongObjectType(m) => write!(f, "wrong object type: {m}"),
         }
     }
 }

@@ -203,6 +203,7 @@ fn chunked(dims: &[u64], index: ChunkIndex, flags: u8) -> DataLayout {
         element_size: E as u64,
         flags,
         index,
+        layout_version: 4,
     })
 }
 

@@ -1,6 +1,10 @@
 //! Data layout message (type 0x0008).
 //!
-//! Spec: "IV.A.2.i. The Data Layout Message", versions 1-4.
+//! Spec: "IV.A.2.i. The Data Layout Message", versions 1-5. Version 5
+//! (file format specification 4.0) is encoded exactly like version 4; it
+//! only changes the width of the "Chunk Size" field of filtered chunk
+//! records in fixed array, extensible array and v2 B-tree indexes (see
+//! [`ChunkedLayout::filtered_chunk_size_width`]).
 
 use crate::error::{Error, Result};
 use crate::format::{ByteReader, Sizes};
@@ -105,6 +109,20 @@ pub struct ChunkedLayout {
     pub flags: u8,
     /// Chunk index.
     pub index: ChunkIndex,
+    /// Version of the layout message this was decoded from (1-5).
+    pub layout_version: u8,
+}
+
+impl ChunkedLayout {
+    /// Width in bytes of the "Chunk Size" field of filtered chunk records
+    /// in fixed array, extensible array and v2 B-tree indexes, when the
+    /// layout version fixes it: the size of offsets for version 5 and
+    /// later. `None` for version 4, where the width is derived from the
+    /// index structure (one byte more than needed for an unfiltered chunk,
+    /// at most 8).
+    pub fn filtered_chunk_size_width(&self, sizes: Sizes) -> Option<u8> {
+        (self.layout_version >= 5).then_some(sizes.offset)
+    }
 }
 
 /// A decoded data layout message.
@@ -158,15 +176,13 @@ impl DataLayout {
         let mut r = ByteReader::with_sizes(data, sizes);
         match r.read_u8()? {
             v @ (1 | 2) => parse_v1_v2(&mut r, v),
-            // Version 5 (written by HDF5 2.0 for filtered chunked datasets) has
-            // the same encoding as version 4.
             v @ (3..=5) => parse_v3_v4(&mut r, v),
             v => Err(Error::unsupported(format!("data layout version {v}"))),
         }
     }
 }
 
-fn parse_v1_v2(r: &mut ByteReader<'_>, _version: u8) -> Result<DataLayout> {
+fn parse_v1_v2(r: &mut ByteReader<'_>, version: u8) -> Result<DataLayout> {
     let ndims = r.read_u8()? as usize;
     let class = r.read_u8()?;
     r.skip(5)?; // reserved
@@ -200,6 +216,7 @@ fn parse_v1_v2(r: &mut ByteReader<'_>, _version: u8) -> Result<DataLayout> {
                 element_size,
                 flags: 0,
                 index: ChunkIndex::BTreeV1 { address },
+                layout_version: version,
             }))
         }
         (c, _) => Err(Error::invalid(format!("unknown layout class {c}"))),
@@ -233,9 +250,10 @@ fn parse_v3_v4(r: &mut ByteReader<'_>, version: u8) -> Result<DataLayout> {
                 element_size,
                 flags: 0,
                 index: ChunkIndex::BTreeV1 { address },
+                layout_version: version,
             }))
         }
-        2 => parse_v4_chunked(r).map(DataLayout::Chunked),
+        2 => parse_v4_chunked(r, version).map(DataLayout::Chunked),
         3 if version >= 4 => Ok(DataLayout::Virtual {
             heap_address: r.read_offset()?,
             heap_index: r.read_u32()?,
@@ -244,7 +262,7 @@ fn parse_v3_v4(r: &mut ByteReader<'_>, version: u8) -> Result<DataLayout> {
     }
 }
 
-fn parse_v4_chunked(r: &mut ByteReader<'_>) -> Result<ChunkedLayout> {
+fn parse_v4_chunked(r: &mut ByteReader<'_>, layout_version: u8) -> Result<ChunkedLayout> {
     let flags = r.read_u8()?;
     let ndims = r.read_u8()? as usize;
     let width = r.read_u8()? as usize;
@@ -318,6 +336,7 @@ fn parse_v4_chunked(r: &mut ByteReader<'_>) -> Result<ChunkedLayout> {
         element_size,
         flags,
         index,
+        layout_version,
     })
 }
 
@@ -482,7 +501,7 @@ mod tests {
     }
 
     #[test]
-    fn v5_matches_v4() {
+    fn v5_matches_v4_single_chunk() {
         // HDF5 2.0 writes version 5 for filtered chunked datasets (seen in
         // the h5py fixtures: filtered single chunk below), encoded exactly
         // like version 4.
@@ -504,6 +523,21 @@ mod tests {
                 })
             }
         );
+    }
+
+    #[test]
+    fn v5_like_v4() {
+        let mut v = v4_chunked(0, 3, &[10]);
+        v[0] = 5;
+        let DataLayout::Chunked(c) = DataLayout::parse(&v, S).unwrap() else {
+            panic!("not chunked");
+        };
+        assert_eq!(c.layout_version, 5);
+        assert_eq!(c.filtered_chunk_size_width(S), Some(8));
+        let DataLayout::Chunked(c) = DataLayout::parse(&v4_chunked(0, 3, &[10]), S).unwrap() else {
+            panic!("not chunked");
+        };
+        assert_eq!(c.filtered_chunk_size_width(S), None);
         assert!(DataLayout::parse(&[6, 1], S).is_err());
     }
 
