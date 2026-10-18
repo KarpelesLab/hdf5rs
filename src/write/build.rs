@@ -41,6 +41,9 @@ pub(crate) struct Built {
     /// (B-tree, local heap) addresses of the root group's symbol table
     /// (compatibility format only).
     pub(crate) root_symtab: Option<(u64, u64)>,
+    /// Hard-link reference counts of new objects; for existing objects,
+    /// the number of references added.
+    pub(crate) ref_counts: Vec<u32>,
 }
 
 /// The attribute message for `attr` with `data` as its value: version 3
@@ -81,6 +84,17 @@ fn compat_dataspace(ds: &Dataspace) -> Result<Dataspace> {
 /// Encode an attribute message with object references left as zeros.
 pub(crate) fn attribute_message(attr: &AttrSpec, sizes: Sizes, compat: bool) -> Result<Vec<u8>> {
     attribute(attr, attr.value.data.clone(), compat)?.encode(sizes)
+}
+
+/// Encode the final attribute message, object references resolved with
+/// `addrs`.
+pub(crate) fn encode_attribute(
+    attr: &AttrSpec,
+    addrs: &[u64],
+    sizes: Sizes,
+    compat: bool,
+) -> Result<Vec<u8>> {
+    attribute(attr, patched(&attr.value, addrs, sizes)?, compat)?.encode(sizes)
 }
 
 /// Apply object reference patches to a copy of `p.data`.
@@ -134,6 +148,7 @@ fn storage_messages(
             },
             3,
         ),
+        LayoutSpec::Foreign(why) => return Err(Error::unsupported(why.clone())),
         LayoutSpec::Chunked(c) => {
             if !c.pipeline.filters.is_empty() {
                 msgs.push(raw(
@@ -157,6 +172,8 @@ struct Ctx<'a> {
     times: Option<ObjectTimes>,
     /// Compatibility (superblock version 0) format.
     compat: bool,
+    /// Group B-tree K values (leaf, internal).
+    group_k: (u16, u16),
 }
 
 impl Ctx<'_> {
@@ -181,7 +198,13 @@ impl Ctx<'_> {
         links
             .iter()
             .map(|l| {
+                if let LinkTargetSpec::Stored(s) = &l.target {
+                    return Ok((l.name.clone(), s.encoded(self.sizes)?));
+                }
                 let target = match &l.target {
+                    LinkTargetSpec::Stored(_) => {
+                        return Err(Error::invalid("stored link in a new group"));
+                    }
                     LinkTargetSpec::Hard(t) => LinkTarget::Hard {
                         address: self.addr_of(t.0)?,
                     },
@@ -462,9 +485,10 @@ fn plan_node(cx: &Ctx<'_>, id: usize) -> Result<NodePlan> {
                     LinkTargetSpec::External { .. } => Err(Error::unsupported(
                         "external links in the compatibility format",
                     )),
+                    LinkTargetSpec::Stored(_) => Err(Error::invalid("stored link in a new group")),
                 })
                 .collect::<Result<Vec<_>>>()?;
-            plan.symtab = Some(SymTabPlan::new(&entries, sizes)?);
+            plan.symtab = Some(SymTabPlan::new(&entries, sizes, cx.group_k)?);
         }
         return Ok(plan);
     }
@@ -486,8 +510,12 @@ pub(crate) fn write_headers<S: WriteAt>(w: &mut FileWriter<S>) -> Result<Built> 
     let n = w.nodes.len();
     // Hard-link reference counts: incoming hard links, the superblock for
     // the root, and datasets using a committed datatype.
+    // For objects that already exist in the file (read-write mode) only
+    // the new references are counted (an increment of their stored count).
     let mut ref_counts = vec![0u32; n];
-    if let Some(r) = ref_counts.first_mut() {
+    if let Some(r) = ref_counts.first_mut()
+        && w.nodes.first().is_some_and(|n| n.origin.is_none())
+    {
         *r = 1;
     }
     let mut bump = |t: usize| -> Result<()> {
@@ -543,8 +571,15 @@ pub(crate) fn write_headers<S: WriteAt>(w: &mut FileWriter<S>) -> Result<Built> 
             sizes,
             times,
             compat,
+            group_k: w.group_k,
         };
         for id in 0..n {
+            if cx.node(id)?.origin.is_some() {
+                // Existing objects are updated in place later.
+                plans.push(NodePlan::default());
+                lens.push(0);
+                continue;
+            }
             let plan = plan_node(&cx, id)?;
             let len = encode_node(
                 &cx,
@@ -559,7 +594,11 @@ pub(crate) fn write_headers<S: WriteAt>(w: &mut FileWriter<S>) -> Result<Built> 
         }
     }
     let mut addresses = Vec::with_capacity(n);
-    for (&len, plan) in lens.iter().zip(&mut plans) {
+    for (id, (&len, plan)) in lens.iter().zip(&mut plans).enumerate() {
+        if let Some(o) = w.nodes.get(id).and_then(|n| n.origin.as_ref()) {
+            addresses.push(o.addr);
+            continue;
+        }
         addresses.push(w.alloc.alloc(len as u64)?);
         if let Some(p) = &mut plan.links {
             p.allocate(&mut w.alloc)?;
@@ -579,12 +618,16 @@ pub(crate) fn write_headers<S: WriteAt>(w: &mut FileWriter<S>) -> Result<Built> 
         sizes,
         times,
         compat,
+        group_k: w.group_k,
     };
     let header_of = |t: usize| -> Result<(u64, Option<(u64, u64)>)> {
         let addr = cx.addr_of(t)?;
         Ok((addr, plans.get(t).and_then(NodePlan::symtab_addrs)))
     };
     for (id, ((&addr, &len), plan)) in addresses.iter().zip(&lens).zip(&plans).enumerate() {
+        if cx.node(id)?.origin.is_some() {
+            continue;
+        }
         let bytes = encode_node(
             &cx,
             id,
@@ -627,5 +670,6 @@ pub(crate) fn write_headers<S: WriteAt>(w: &mut FileWriter<S>) -> Result<Built> 
         addresses,
         root_address,
         root_symtab,
+        ref_counts,
     })
 }

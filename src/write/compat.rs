@@ -70,6 +70,8 @@ pub(crate) type HeaderLookup<'a> = dyn Fn(usize) -> Result<(u64, Option<(u64, u6
 #[derive(Debug, Clone)]
 pub(crate) struct SymTabPlan {
     sizes: Sizes,
+    /// Group B-tree K values (leaf, internal).
+    k: (u16, u16),
     /// Entries sorted by name: (name offset, target, soft value offset).
     entries: Vec<(u64, EntryTarget, u64)>,
     heap_data: Vec<u8>,
@@ -96,7 +98,11 @@ fn push_string(data: &mut Vec<u8>, s: &[u8]) -> u64 {
 
 impl SymTabPlan {
     /// Plan a symbol table for `links` (name, target).
-    pub(crate) fn new(links: &[(String, EntryTarget)], sizes: Sizes) -> Result<SymTabPlan> {
+    pub(crate) fn new(
+        links: &[(String, EntryTarget)],
+        sizes: Sizes,
+        k: (u16, u16),
+    ) -> Result<SymTabPlan> {
         let mut sorted: Vec<&(String, EntryTarget)> = links.iter().collect();
         sorted.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
         // Offset 0 holds the empty string (the B-tree's left-most key).
@@ -130,9 +136,9 @@ impl SymTabPlan {
         free.write_length(1)?;
         free.write_length(2 * l as u64)?;
         heap_data.extend_from_slice(free.as_slice());
-        let per_snod = 2 * usize::from(GROUP_LEAF_K);
+        let per_snod = 2 * usize::from(k.0);
         let snod_count = entries.len().div_ceil(per_snod);
-        let fanout = 2 * usize::from(GROUP_INTERNAL_K);
+        let fanout = 2 * usize::from(k.1);
         let mut levels = Vec::new();
         let mut width = snod_count;
         loop {
@@ -151,6 +157,7 @@ impl SymTabPlan {
         }
         Ok(SymTabPlan {
             sizes,
+            k,
             entries,
             heap_data,
             free_offset,
@@ -168,11 +175,11 @@ impl SymTabPlan {
         let sizes = self.sizes;
         self.heap_addr = alloc.alloc(LocalHeap::header_size(sizes) as u64)?;
         self.heap_data_addr = alloc.alloc(self.heap_data.len() as u64)?;
-        let snod = SymbolTableNode::node_size(sizes, GROUP_LEAF_K) as u64;
+        let snod = SymbolTableNode::node_size(sizes, self.k.0) as u64;
         self.snod_addrs = (0..self.snod_count)
             .map(|_| alloc.alloc(snod))
             .collect::<Result<_>>()?;
-        let node = BTreeNode::group_node_size(sizes, GROUP_INTERNAL_K) as u64;
+        let node = BTreeNode::group_node_size(sizes, self.k.1) as u64;
         self.node_addrs = self
             .levels
             .iter()
@@ -218,7 +225,7 @@ impl SymTabPlan {
             )?,
         )?;
         storage.write_all_at(self.heap_data_addr, &self.heap_data)?;
-        let per_snod = 2 * usize::from(GROUP_LEAF_K);
+        let per_snod = 2 * usize::from(self.k.0);
         // Last name offset of each SNOD: the B-tree keys.
         let mut snod_keys = Vec::with_capacity(self.snod_count);
         for (i, chunk) in self.entries.chunks(per_snod).enumerate() {
@@ -253,7 +260,7 @@ impl SymTabPlan {
                 node.entries.push(entry);
             }
             let addr = *self.snod_addrs.get(i).ok_or(Error::UnexpectedEof)?;
-            storage.write_all_at(addr, &node.encode(sizes, GROUP_LEAF_K)?)?;
+            storage.write_all_at(addr, &node.encode(sizes, self.k.0)?)?;
             snod_keys.push(chunk.last().map_or(0, |e| e.0));
         }
         // B-tree levels: (first key, last key) of every node of the level
@@ -289,7 +296,7 @@ impl SymTabPlan {
                         .ok_or_else(|| Error::invalid("group B-tree plan out of range"))?
                         .to_vec(),
                 };
-                storage.write_all_at(addrs[j], &node.encode_group(sizes, GROUP_INTERNAL_K)?)?;
+                storage.write_all_at(addrs[j], &node.encode_group(sizes, self.k.1)?)?;
                 next.push((keys[0], keys.last().copied().unwrap_or(0)));
             }
             below = next;
@@ -330,7 +337,8 @@ mod tests {
                     (format!("n{i:05}"), t)
                 })
                 .collect();
-            let mut plan = SymTabPlan::new(&links, sizes).unwrap();
+            let mut plan =
+                SymTabPlan::new(&links, sizes, (GROUP_LEAF_K, GROUP_INTERNAL_K)).unwrap();
             let mut alloc = Allocator::new(0, sizes);
             plan.allocate(&mut alloc).unwrap();
             let mut out: Vec<u8> = Vec::new();

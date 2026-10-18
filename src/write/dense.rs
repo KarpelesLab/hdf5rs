@@ -254,6 +254,9 @@ pub(crate) struct DensePlan {
     root_addr: u64,
     block_addrs: Vec<u64>,
     huge_addrs: Vec<u64>,
+    /// Attribute name records: (message flags, creation order) per object,
+    /// in input order (empty: unshared, untracked).
+    record_info: Vec<(u8, u32)>,
 }
 
 /// Least number of bytes able to encode `v` (1..=8).
@@ -376,6 +379,7 @@ impl DensePlan {
             root_addr: UNDEFINED_ADDRESS,
             block_addrs: Vec::new(),
             huge_addrs: Vec::new(),
+            record_info: Vec::new(),
         })
     }
 
@@ -437,7 +441,14 @@ impl DensePlan {
         self.tree.header_addr
     }
 
-    fn heap_id(&self, i: usize) -> Result<Vec<u8>> {
+    /// Set the (message flags, creation order) stored in the attribute
+    /// name index record of each object, in input order.
+    pub(crate) fn set_record_info(&mut self, info: Vec<(u8, u32)>) {
+        self.record_info = info;
+    }
+
+    /// The heap ID of object `i` (input order).
+    pub(crate) fn heap_id(&self, i: usize) -> Result<Vec<u8>> {
         let mut w = ByteWriter::with_sizes(self.sizes);
         match self.placements.get(i) {
             Some(Placement::Managed { offset, .. }) => {
@@ -598,8 +609,11 @@ impl DensePlan {
                 DenseKind::Links => Record::LinkName { hash, heap_id },
                 DenseKind::Attributes => Record::AttributeName {
                     heap_id,
-                    message_flags: 0,
-                    creation_order: UNTRACKED_CREATION_ORDER,
+                    message_flags: self.record_info.get(i).map_or(0, |r| r.0),
+                    creation_order: self
+                        .record_info
+                        .get(i)
+                        .map_or(UNTRACKED_CREATION_ORDER, |r| r.1),
                     hash,
                 },
             });

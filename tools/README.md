@@ -54,5 +54,24 @@ cargo run --example write_demo -- /tmp/demo.h5 v3     # or v2 / v0; add o4 / tim
 The CI `interop` job runs it for superblock v0 (compatibility format), v2,
 v3 and 4-byte offsets.
 
+## `check_modified.py` — files modified by hdf5rs, checked by h5py
+
+Black-box check of the read-write mode (`FileWriter::open_rw`): h5py
+creates files in several modes (libver earliest / v108 / latest, with and
+without creation-order tracking, a non-default file space strategy),
+`examples/modify_demo.rs` modifies them (`scenario`: dense/compact
+transitions, symbol-table growth, deletions, attribute overwrite, writes
+into every chunk index, resize, append; `touch`: changes every object and
+rewrites every dataset), and h5py checks the expected changes and that
+everything else is unchanged, then modifies the result itself. Files with
+persistent free-space managers / paged allocation must be refused. The
+reverse direction is covered too: a `write_demo` file modified by h5py,
+then by hdf5rs, then by h5py again, read back by hdf5rs.
+
+```sh
+cargo build --examples
+/tmp/hdf5rs-venv/bin/python tools/check_modified.py   # --keep DIR keeps the files
+```
+
 Clean-room reminder: only use h5py's public API to create and inspect files;
 never read libhdf5 or h5py source code.

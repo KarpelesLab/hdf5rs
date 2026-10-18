@@ -127,6 +127,8 @@ pub(crate) struct ChunkedSpec {
     cache_bytes: usize,
     /// Base address of an implicit index.
     implicit_base: u64,
+    /// K of a version 1 B-tree index.
+    pub(crate) btree_k: u16,
     /// The finished index (set by [`ChunkedSpec::finalize`]).
     index: Option<ChunkIndex>,
 }
@@ -157,8 +159,20 @@ impl ChunkedSpec {
             cache: BTreeMap::new(),
             cache_bytes: 0,
             implicit_base: UNDEFINED_ADDRESS,
+            btree_k: CHUNK_BTREE_K,
             index: None,
         })
+    }
+
+    /// Record a chunk that is already stored (existing files); `capacity`
+    /// bytes at its address may be overwritten in place.
+    pub(crate) fn insert_stored(&mut self, scaled: Vec<u64>, record: ChunkRecord, capacity: u64) {
+        self.stored.insert(scaled, Stored { record, capacity });
+    }
+
+    /// Set the base address of an existing implicit index.
+    pub(crate) fn set_implicit_base(&mut self, address: u64) {
+        self.implicit_base = address;
     }
 
     fn filtered(&self) -> bool {
@@ -662,7 +676,7 @@ impl ChunkedSpec {
                     };
                     Some(encode_chunk_btree(
                         sizes,
-                        CHUNK_BTREE_K,
+                        self.btree_k,
                         &entries,
                         &end_key,
                         env.element_size as u64,

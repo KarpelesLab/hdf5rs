@@ -44,9 +44,103 @@
 //!   offset 0, whose space is reserved from the start.
 //!
 //! Space is never reused and the file is complete only after `finish`;
-//! dropping a writer leaves an invalid file. In-place modification of
-//! existing files can later build on the same model by loading headers
-//! into it and allocating new space past the existing end of file.
+//! dropping a writer leaves an invalid file.
+//!
+//! # Modifying existing files
+//!
+//! [`FileWriter::open_rw`] (or [`open_rw_bytes`](FileWriter::open_rw_bytes)
+//! / [`open_rw_with`](FileWriter::open_rw_with)) opens an existing file —
+//! written by this crate or by the reference library, superblock version
+//! 0, 1, 2 or 3 — for modification through the same handles as a new
+//! file; [`finish`](FileWriter::finish) writes the changes:
+//!
+//! ```
+//! use hdf5rs::write::FileWriter;
+//! use hdf5rs::Selection;
+//!
+//! # let mut f = FileWriter::in_memory();
+//! # f.root().create_group("g")?.new_dataset::<i32>("d").shape(&[0]).max_shape(&[None]).chunk(&[4]).create()?;
+//! # let bytes = f.finish()?;
+//! let mut f = FileWriter::open_rw_bytes(bytes)?;
+//! let mut g = f.group("/g")?;
+//! g.set_attr("note", "modified")?;
+//! g.create_group("new")?;
+//! let mut d = g.dataset("d")?;
+//! d.append(&[1, 2, 3])?;
+//! d.write_selection(&Selection::range(0..1), &[10])?;
+//! let file = hdf5rs::File::from_bytes(f.finish()?)?;
+//! assert_eq!(file.dataset("/g/d")?.read::<i32>()?, [10, 2, 3]);
+//! # Ok::<(), hdf5rs::Error>(())
+//! ```
+//!
+//! Supported changes:
+//!
+//! - create groups, datasets, committed datatypes, hard/soft/external
+//!   links and attributes anywhere (new objects use the file's format:
+//!   the compatibility encodings for superblocks 0/1); hard links to
+//!   existing objects update their reference count;
+//! - remove links ([`GroupWriter::unlink`], [`FileWriter::unlink`]) and
+//!   attributes ([`GroupWriter::delete_attr`], …); replace attribute
+//!   values ([`GroupWriter::set_attr`] on an existing name);
+//! - new-style groups and attributes switch between compact and dense
+//!   storage following the object's own phase-change values (Group Info
+//!   message, object header), creation order (and its index) is
+//!   maintained; dense storage is rebuilt (fractal heap and v2 B-tree
+//!   name / creation-order indexes) rather than edited in place;
+//! - old-style (symbol table) groups: the symbol table nodes and B-tree
+//!   are rebuilt with the file's K values and the local heap grows, while
+//!   the addresses of the heap header and B-tree root (cached by parents
+//!   and the superblock) stay the same;
+//! - write into existing datasets ([`DatasetWriter::write_selection`]):
+//!   contiguous and compact data in place, chunked data with the existing
+//!   filters and chunk index type (single chunk, implicit, fixed array,
+//!   extensible array, v1 and v2 B-trees; the index is rebuilt when the
+//!   dataset changes); [`resize`](DatasetWriter::resize) /
+//!   [`append`](DatasetWriter::append) chunked datasets within their
+//!   maximum dimensions.
+//!
+//! Object headers are rewritten in place: the first chunk keeps its
+//! address and size (spare room becomes NIL messages); messages that do
+//! not fit go to one new continuation chunk (`OCHK` for version 2
+//! headers) and the old continuation chunks are abandoned. Checksums are
+//! recomputed, reference counts updated and modification times refreshed
+//! when the object records them.
+//!
+//! Space management: new structures are appended at the end of the file
+//! and the end-of-file address in the superblock is updated (with its
+//! checksum for versions 2/3). Space freed by deletions and rewrites is
+//! not reused or reclaimed (it is leaked; a repacking tool recovers it).
+//! Files whose free space is tracked persistently, or that use paged
+//! aggregation (File Space Info message), or a non-default file driver,
+//! are refused with [`Error::Unsupported`]
+//! rather than risk corrupting their free-space managers. Shared (SOHM)
+//! messages are kept as they are; new messages are not shared, and
+//! removing a shared attribute leaves its shared copy's reference count
+//! unchanged (a leak, never a dangling reference).
+//!
+//! Consistency: until `finish`, existing metadata is not modified, only
+//! raw data written in place (contiguous datasets, unfiltered chunks).
+//! `finish` writes every new structure (objects, chunk indexes, dense
+//! storage, symbol table nodes, continuation chunks) in fresh space
+//! first, then the new end-of-file address, and only then rewrites the
+//! structures whose address is referenced from elsewhere — the first
+//! chunk of each modified object header, and the local heap header and
+//! B-tree root of modified symbol-table groups — one write each. A crash
+//! before that last phase leaves the old metadata intact; during it, each
+//! object is either in its old or new state as far as single writes are
+//! atomic (filtered chunks are never overwritten in place). Version 3
+//! superblocks are marked "open for writing" when the file is opened and
+//! unmarked as the very last write, so an interrupted session is
+//! detected by the reference library (`h5clear` resets the flag); this
+//! crate likewise refuses to open a file carrying the flag. Dropping the
+//! writer without calling `finish` discards the metadata changes (but
+//! leaves the flag set).
+//!
+//! Not supported: writing virtual datasets and datasets stored in
+//! external files, raw writes of variable-length data
+//! ([`write_selection`](DatasetWriter::write_selection) with Rust values
+//! works), changing a dataset's datatype or layout, and paths through
+//! soft or external links.
 //!
 //! # Compatibility format
 //!
@@ -126,6 +220,7 @@ mod build;
 mod chunked;
 mod compat;
 mod dense;
+mod edit;
 mod heap;
 mod storage;
 mod value;
@@ -149,7 +244,7 @@ use crate::format::superblock::Superblock;
 use crate::read::{Resolved, Selection, block_runs, for_each_run, row_major_strides};
 use chunked::{ChunkedSpec, Env, IndexKind};
 use heap::HeapWriter;
-use storage::Allocator;
+use storage::{Allocator, Based};
 
 /// Largest compact dataset payload accepted (the layout message must fit a
 /// 16-bit header message size together with its own fields).
@@ -206,7 +301,13 @@ pub(crate) struct Patched {
 pub(crate) enum LinkTargetSpec {
     Hard(ObjectId),
     Soft(String),
-    External { file: String, path: String },
+    External {
+        file: String,
+        path: String,
+    },
+    /// A link that already existed when the file was opened read-write,
+    /// kept as stored.
+    Stored(Box<edit::StoredLink>),
 }
 
 #[derive(Debug, Clone)]
@@ -226,8 +327,14 @@ pub(crate) struct AttrSpec {
 #[derive(Debug, Clone)]
 pub(crate) enum LayoutSpec {
     Compact(Patched),
-    Contiguous { address: u64, size: u64 },
+    Contiguous {
+        address: u64,
+        size: u64,
+    },
     Chunked(Box<ChunkedSpec>),
+    /// Storage of an existing dataset that cannot be written (virtual
+    /// datasets, external raw data files, …); describes why.
+    Foreign(String),
 }
 
 #[derive(Debug, Clone)]
@@ -250,6 +357,9 @@ pub(crate) enum NodeKind {
 pub(crate) struct Node {
     pub(crate) kind: NodeKind,
     pub(crate) attrs: Vec<AttrSpec>,
+    /// For objects that existed when the file was opened read-write: their
+    /// on-disk state and what changed.
+    pub(crate) origin: Option<Box<edit::Origin>>,
 }
 
 /// Writer for a new HDF5 file.
@@ -258,7 +368,7 @@ pub(crate) struct Node {
 /// then call [`finish`](FileWriter::finish).
 #[derive(Debug)]
 pub struct FileWriter<S: WriteAt> {
-    storage: S,
+    storage: Based<S>,
     opts: WriteOptions,
     alloc: Allocator,
     heap: HeapWriter,
@@ -270,6 +380,12 @@ pub struct FileWriter<S: WriteAt> {
     filters: FilterRegistry,
     /// Budget of the partially-written chunk cache, per dataset.
     chunk_cache_bytes: usize,
+    /// Group B-tree K values (leaf, internal) of symbol-table groups.
+    group_k: (u16, u16),
+    /// K of chunk v1 B-trees.
+    chunk_k: u16,
+    /// State of a file opened read-write (`None` for new files).
+    existing: Option<Box<edit::ExistingFile>>,
 }
 
 impl FileWriter<std::fs::File> {
@@ -295,27 +411,39 @@ impl FileWriter<Vec<u8>> {
     /// A writer producing the file in memory; [`finish`](Self::finish)
     /// returns the bytes.
     pub fn in_memory() -> Self {
-        FileWriter {
-            storage: Vec::new(),
-            opts: WriteOptions::default(),
-            alloc: Allocator::new(
-                Superblock::encoded_size_v23(Sizes::DEFAULT) as u64,
-                Sizes::DEFAULT,
-            ),
-            heap: HeapWriter::default(),
-            nodes: vec![Node::group()],
-            data_refs: Vec::new(),
-            filters: FilterRegistry::with_builtin(),
-            chunk_cache_bytes: chunked::DEFAULT_CACHE_BYTES,
+        match FileWriter::new(Vec::new(), WriteOptions::default()) {
+            Ok(w) => w,
+            // Unreachable: the default options are valid.
+            Err(_) => FileWriter {
+                storage: Based::new(Vec::new()),
+                opts: WriteOptions::default(),
+                alloc: Allocator::new(
+                    Superblock::encoded_size_v23(Sizes::DEFAULT) as u64,
+                    Sizes::DEFAULT,
+                ),
+                heap: HeapWriter::default(),
+                nodes: vec![Node::group()],
+                data_refs: Vec::new(),
+                filters: FilterRegistry::with_builtin(),
+                chunk_cache_bytes: chunked::DEFAULT_CACHE_BYTES,
+                group_k: (compat::GROUP_LEAF_K, compat::GROUP_INTERNAL_K),
+                chunk_k: chunked::CHUNK_BTREE_K,
+                existing: None,
+            },
         }
     }
 }
 
 impl Node {
     fn group() -> Node {
+        Node::new(NodeKind::Group { links: Vec::new() })
+    }
+
+    pub(crate) fn new(kind: NodeKind) -> Node {
         Node {
-            kind: NodeKind::Group { links: Vec::new() },
+            kind,
             attrs: Vec::new(),
+            origin: None,
         }
     }
 }
@@ -367,7 +495,7 @@ impl<S: WriteAt> FileWriter<S> {
             Superblock::encoded_size_v23(options.sizes)
         } as u64;
         Ok(FileWriter {
-            storage,
+            storage: Based::new(storage),
             opts: options,
             alloc: Allocator::new(start, options.sizes),
             heap: HeapWriter::default(),
@@ -375,6 +503,9 @@ impl<S: WriteAt> FileWriter<S> {
             data_refs: Vec::new(),
             filters: FilterRegistry::with_builtin(),
             chunk_cache_bytes: chunked::DEFAULT_CACHE_BYTES,
+            group_k: (compat::GROUP_LEAF_K, compat::GROUP_INTERNAL_K),
+            chunk_k: chunked::CHUNK_BTREE_K,
+            existing: None,
         })
     }
 
@@ -426,7 +557,7 @@ impl<S: WriteAt> FileWriter<S> {
     }
 
     /// The object at an absolute path (hard links only).
-    pub fn object_id(&self, path: &str) -> Result<ObjectId> {
+    pub fn object_id(&mut self, path: &str) -> Result<ObjectId> {
         self.resolve(path).map(ObjectId)
     }
 
@@ -441,16 +572,39 @@ impl<S: WriteAt> FileWriter<S> {
         self.set_attr_on(id, name, value)
     }
 
+    /// Delete attribute `name` of the object at `path`.
+    pub fn delete_attr(&mut self, path: &str, name: &str) -> Result<()> {
+        let id = self.resolve(path)?;
+        self.delete_attr_on(id, name)
+    }
+
+    /// Remove the link at `path` (its last component, in the group named
+    /// by the rest). The target object is not deleted.
+    pub fn unlink(&mut self, path: &str) -> Result<()> {
+        let trimmed = path.trim_end_matches('/');
+        let (parent, name) = match trimmed.rfind('/') {
+            Some(i) => (&trimmed[..i], &trimmed[i + 1..]),
+            None => ("", trimmed),
+        };
+        let parent = if parent.is_empty() && path.starts_with('/') {
+            "/"
+        } else {
+            parent
+        };
+        let pid = self.resolve(parent)?;
+        self.delete_link(pid, name)
+    }
+
     /// Whether the compatibility (superblock version 0) format is used.
     fn is_compat(&self) -> bool {
         self.opts.superblock_version < 2
     }
 
-    fn resolve(&self, path: &str) -> Result<usize> {
+    fn resolve(&mut self, path: &str) -> Result<usize> {
         self.resolve_from(0, path)
     }
 
-    fn resolve_from(&self, start: usize, path: &str) -> Result<usize> {
+    fn resolve_from(&mut self, start: usize, path: &str) -> Result<usize> {
         let mut cur = if path.starts_with('/') { 0 } else { start };
         for comp in path.split('/').filter(|c| !c.is_empty() && *c != ".") {
             let Some(NodeKind::Group { links }) = self.nodes.get(cur).map(|n| &n.kind) else {
@@ -458,6 +612,10 @@ impl<S: WriteAt> FileWriter<S> {
             };
             match links.iter().find(|l| l.name == comp).map(|l| &l.target) {
                 Some(LinkTargetSpec::Hard(id)) => cur = id.0,
+                Some(LinkTargetSpec::Stored(s)) if s.hard_address().is_some() => {
+                    let addr = s.hard_address().unwrap_or(UNDEFINED_ADDRESS);
+                    cur = self.load_existing(addr)?;
+                }
                 Some(_) => {
                     return Err(Error::unsupported(format!(
                         "writer path {path:?} goes through a soft or external link"
@@ -492,6 +650,9 @@ impl<S: WriteAt> FileWriter<S> {
             name: name.to_owned(),
             target,
         });
+        if let Some(o) = self.origin_mut(parent) {
+            o.links_dirty = true;
+        }
         Ok(())
     }
 
@@ -553,6 +714,7 @@ impl<S: WriteAt> FileWriter<S> {
                 "attribute too large for the compatibility format (64 KiB)",
             ));
         }
+        self.before_put_attr(id, &attr.name)?;
         let node = self
             .nodes
             .get_mut(id)
@@ -566,26 +728,47 @@ impl<S: WriteAt> FileWriter<S> {
 
     /// Write all metadata and the superblock, returning the storage.
     pub fn finish(mut self) -> Result<S> {
+        match self.write_all() {
+            Ok(()) => Ok(self.storage.inner),
+            Err(e) => {
+                self.abandon_edits();
+                Err(e)
+            }
+        }
+    }
+
+    fn write_all(&mut self) -> Result<()> {
         let sizes = self.opts.sizes;
         for id in 0..self.nodes.len() {
-            if let Some(NodeKind::Dataset(DatasetSpec {
-                layout: LayoutSpec::Chunked(_),
-                ..
-            })) = self.nodes.get(id).map(|n| &n.kind)
+            let Some(node) = self.nodes.get(id) else {
+                continue;
+            };
+            // Existing datasets keep their index unless they were changed.
+            let touched = node.origin.as_ref().is_none_or(|o| o.layout_dirty);
+            if touched
+                && let NodeKind::Dataset(DatasetSpec {
+                    layout: LayoutSpec::Chunked(_),
+                    ..
+                }) = &node.kind
             {
                 self.with_chunks(id, |c, env| c.finalize(env))?;
             }
         }
         self.heap.flush(sizes, &mut self.storage)?;
-        let root = build::write_headers(&mut self)?;
+        let root = build::write_headers(self)?;
         let width = sizes.offset as usize;
-        let addrs = root.addresses;
+        let addrs = &root.addresses;
         for &(pos, target) in &self.data_refs {
             let addr = *addrs
                 .get(target.0)
                 .ok_or_else(|| Error::invalid("object reference to an unknown object"))?;
             self.storage
                 .write_all_at(pos, &addr.to_le_bytes()[..width.min(8)])?;
+        }
+        if self.existing.is_some() {
+            self.apply_edits(&root)?;
+            let eof = self.alloc.eoa();
+            return self.storage.finish(eof);
         }
         let eof = self.alloc.eoa();
         let sb = match root.root_symtab {
@@ -599,8 +782,7 @@ impl<S: WriteAt> FileWriter<S> {
             }
         };
         self.storage.write_all_at(0, &sb.encode()?)?;
-        self.storage.finish(eof)?;
-        Ok(self.storage)
+        self.storage.finish(eof)
     }
 }
 
@@ -629,6 +811,15 @@ impl<'w, S: WriteAt> GroupWriter<'w, S> {
         match self.w.nodes.get(id).map(|n| &n.kind) {
             Some(NodeKind::Group { .. }) => Ok(GroupWriter { w: self.w, id }),
             _ => Err(Error::WrongObjectType(format!("{path} is not a group"))),
+        }
+    }
+
+    /// An existing dataset, by path relative to this group (or absolute).
+    pub fn dataset(&mut self, path: &str) -> Result<DatasetWriter<'_, S>> {
+        let id = self.w.resolve_from(self.id, path)?;
+        match self.w.nodes.get(id).map(|n| &n.kind) {
+            Some(NodeKind::Dataset(_)) => Ok(DatasetWriter { w: self.w, id }),
+            _ => Err(Error::WrongObjectType(format!("{path} is not a dataset"))),
         }
     }
 
@@ -684,14 +875,9 @@ impl<'w, S: WriteAt> GroupWriter<'w, S> {
     /// Store `datatype` as a named (committed) datatype object.
     pub fn commit_datatype(&mut self, name: &str, datatype: Datatype) -> Result<ObjectId> {
         datatype.encode()?;
-        let id = self.w.add_node(
-            self.id,
-            name,
-            Node {
-                kind: NodeKind::NamedDatatype(datatype),
-                attrs: Vec::new(),
-            },
-        )?;
+        let id = self
+            .w
+            .add_node(self.id, name, Node::new(NodeKind::NamedDatatype(datatype)))?;
         Ok(ObjectId(id))
     }
 
@@ -747,6 +933,33 @@ impl<'w, S: WriteAt> GroupWriter<'w, S> {
         data: &[u8],
     ) -> Result<()> {
         set_attr_raw(self.w, self.id, name, datatype, shape, data)
+    }
+
+    /// Delete the attribute called `name`.
+    pub fn delete_attr(&mut self, name: &str) -> Result<()> {
+        self.w.delete_attr_on(self.id, name)
+    }
+
+    /// Names of this group's attributes, sorted.
+    pub fn attr_names(&mut self) -> Result<Vec<String>> {
+        self.w.attr_names(self.id)
+    }
+
+    /// Remove the link called `name` from this group. The object it
+    /// pointed to is not deleted (its space is not reclaimed) and stays
+    /// reachable through its other hard links, if any.
+    pub fn unlink(&mut self, name: &str) -> Result<()> {
+        self.w.delete_link(self.id, name)
+    }
+
+    /// Names of this group's links, sorted.
+    pub fn link_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = match self.w.nodes.get(self.id).map(|n| &n.kind) {
+            Some(NodeKind::Group { links }) => links.iter().map(|l| l.name.clone()).collect(),
+            _ => Vec::new(),
+        };
+        names.sort();
+        names
     }
 }
 
@@ -833,6 +1046,7 @@ impl<S: WriteAt> FileWriter<S> {
         id: usize,
         f: impl FnOnce(&mut ChunkedSpec, &mut Env<'_>) -> Result<R>,
     ) -> Result<R> {
+        self.ensure_chunks(id)?;
         let FileWriter {
             storage,
             opts,
@@ -881,7 +1095,14 @@ impl<S: WriteAt> FileWriter<S> {
         if resolved.count == 0 {
             return Ok(());
         }
+        if matches!(d.layout, LayoutSpec::Chunked(_) | LayoutSpec::Compact(_))
+            && let Some(o) = self.origin_mut(id)
+        {
+            o.layout_dirty = true;
+        }
+        let d = self.dataset_spec(id)?;
         match &d.layout {
+            LayoutSpec::Foreign(why) => Err(Error::unsupported(why.clone())),
             LayoutSpec::Chunked(_) => self.with_chunks(id, |c, env| c.write(env, &resolved, data)),
             LayoutSpec::Compact(_) => {
                 let dims = d.dataspace.dims.clone();
@@ -919,6 +1140,9 @@ impl<S: WriteAt> FileWriter<S> {
                     }
                     let d = self.dataset_spec_mut(id)?;
                     d.layout = LayoutSpec::Contiguous { address, size };
+                    if let Some(o) = self.origin_mut(id) {
+                        o.layout_dirty = true;
+                    }
                 }
                 let storage = &mut self.storage;
                 copy_runs(&resolved, &dims, esize as usize, data, &mut |pos, bytes| {
@@ -980,6 +1204,16 @@ impl<S: WriteAt> DatasetWriter<'_, S> {
         set_attr_raw(self.w, self.id, name, datatype, shape, data)
     }
 
+    /// Delete the attribute called `name`.
+    pub fn delete_attr(&mut self, name: &str) -> Result<()> {
+        self.w.delete_attr_on(self.id, name)
+    }
+
+    /// Names of this dataset's attributes, sorted.
+    pub fn attr_names(&mut self) -> Result<Vec<String>> {
+        self.w.attr_names(self.id)
+    }
+
     /// Current dimensions.
     pub fn shape(&self) -> Result<Vec<u64>> {
         Ok(self.w.dataset_spec(self.id)?.dataspace.dims.clone())
@@ -1000,7 +1234,7 @@ impl<S: WriteAt> DatasetWriter<'_, S> {
     /// references.
     pub fn write_selection<T: H5Write>(&mut self, selection: &Selection, data: &[T]) -> Result<()> {
         let dt = self.w.dataset_spec(self.id)?.datatype.clone();
-        if T::datatype(self.w.opts.sizes) != dt {
+        if !edit::same_type(&T::datatype(self.w.opts.sizes), &dt) {
             return Err(Error::invalid(
                 "Rust type does not match the dataset datatype",
             ));
@@ -1048,9 +1282,14 @@ impl<S: WriteAt> DatasetWriter<'_, S> {
             ));
         }
         element_count(dims)?;
+        self.w.check_dataspace_writable(self.id)?;
         self.w.with_chunks(self.id, |c, env| c.resize(env, dims))?;
         let d = self.w.dataset_spec_mut(self.id)?;
         d.dataspace.dims = dims.to_vec();
+        if let Some(o) = self.w.origin_mut(self.id) {
+            o.dataspace_dirty = true;
+            o.layout_dirty = true;
+        }
         Ok(())
     }
 
@@ -1563,14 +1802,7 @@ impl<'w, S: WriteAt, T: ?Sized> DatasetBuilder<'w, S, T> {
             layout,
             fill: FillValue::new_v3(alloc_time, fill),
         };
-        let id = w.add_node(
-            parent,
-            &name,
-            Node {
-                kind: NodeKind::Dataset(spec),
-                attrs: Vec::new(),
-            },
-        )?;
+        let id = w.add_node(parent, &name, Node::new(NodeKind::Dataset(spec)))?;
         Ok(DatasetWriter { w, id })
     }
 
@@ -1639,7 +1871,9 @@ impl<'w, S: WriteAt, T: ?Sized> DatasetBuilder<'w, S, T> {
             }
             IndexKind::BTreeV1
         };
-        let spec = ChunkedSpec::new(chunk, pipeline, kind, self.partial_unfiltered, early, esize)?;
+        let mut spec =
+            ChunkedSpec::new(chunk, pipeline, kind, self.partial_unfiltered, early, esize)?;
+        spec.btree_k = self.w.chunk_k;
         let DatasetBuilder {
             w,
             parent,
@@ -1663,14 +1897,7 @@ impl<'w, S: WriteAt, T: ?Sized> DatasetBuilder<'w, S, T> {
             layout: LayoutSpec::Chunked(Box::new(spec)),
             fill: FillValue::new_v3(alloc_time, fill),
         };
-        let id = w.add_node(
-            parent,
-            &name,
-            Node {
-                kind: NodeKind::Dataset(spec),
-                attrs: Vec::new(),
-            },
-        )?;
+        let id = w.add_node(parent, &name, Node::new(NodeKind::Dataset(spec)))?;
         if kind == IndexKind::Implicit {
             w.with_chunks(id, |c, env| c.allocate_implicit(env))?;
         }

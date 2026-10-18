@@ -114,6 +114,47 @@ impl<W: Write + Seek> WriteAt for SeekWriter<W> {
     }
 }
 
+/// Storage whose positions are file addresses relative to `base` (the
+/// superblock's offset: non-zero when the file starts with a user block).
+#[derive(Debug)]
+pub(crate) struct Based<S> {
+    pub(crate) inner: S,
+    pub(crate) base: u64,
+}
+
+impl<S> Based<S> {
+    pub(crate) fn new(inner: S) -> Self {
+        Based { inner, base: 0 }
+    }
+
+    fn abs(&self, pos: u64) -> Result<u64> {
+        self.base
+            .checked_add(pos)
+            .ok_or(Error::LimitExceeded("file position overflows"))
+    }
+}
+
+impl<S: WriteAt> WriteAt for Based<S> {
+    fn write_all_at(&mut self, pos: u64, data: &[u8]) -> Result<()> {
+        let pos = self.abs(pos)?;
+        self.inner.write_all_at(pos, data)
+    }
+
+    fn finish(&mut self, len: u64) -> Result<()> {
+        let len = self.abs(len)?;
+        self.inner.finish(len)
+    }
+
+    fn supports_read_back(&self) -> bool {
+        self.inner.supports_read_back()
+    }
+
+    fn read_exact_at(&mut self, pos: u64, buf: &mut [u8]) -> Result<()> {
+        let pos = self.abs(pos)?;
+        self.inner.read_exact_at(pos, buf)
+    }
+}
+
 /// Append-only space allocator: hands out consecutive address ranges
 /// starting after the superblock. Freed space is never reused (yet).
 #[derive(Debug, Clone)]

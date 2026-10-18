@@ -114,6 +114,25 @@
 //! f.finish()?;
 //! # Ok::<(), hdf5rs::Error>(())
 //! ```
+//!
+//! # Modifying a file
+//!
+//! Existing files (written by this crate or by the reference library) can
+//! be opened read-write; see
+//! [Modifying existing files](mod@write#modifying-existing-files).
+//!
+//! ```no_run
+//! use hdf5rs::write::FileWriter;
+//! use hdf5rs::Selection;
+//!
+//! let mut f = FileWriter::open_rw("data.h5")?;
+//! f.group("/results")?.set_attr("checked", &true)?;
+//! f.dataset("/results/log")?.append(&[1.5f64, 2.5])?;
+//! f.dataset("/results/grid")?.write_selection(&Selection::from_ranges(&[0..1, 0..2]), &[7i32, 8])?;
+//! f.unlink("/scratch")?;
+//! f.finish()?;
+//! # Ok::<(), hdf5rs::Error>(())
+//! ```
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]

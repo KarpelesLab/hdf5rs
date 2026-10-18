@@ -61,3 +61,7 @@ jobs:
           cargo run --example write_demo -- "$out/o4.h5" v3 o4 times
           cargo run --example write_demo -- "$out/v0.h5" v0
           python tools/check_written.py "$out"/*.h5
+      - name: read-write mode (files modified by hdf5rs, checked by h5py)
+        run: |
+          cargo build --examples
+          python tools/check_modified.py --bin target/debug/examples
